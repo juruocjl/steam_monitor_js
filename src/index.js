@@ -142,6 +142,48 @@ function persistRefreshToken(token) {
   console.log('已自动保存最新 STEAM_REFRESH_TOKEN 到 .env');
 }
 
+function readRawEnvValue(key) {
+  if (!fs.existsSync(ENV_FILE)) {
+    return null;
+  }
+
+  const lines = fs.readFileSync(ENV_FILE, 'utf8').split(/\r?\n/);
+  const targetPrefix = `${key}=`;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) {
+      continue;
+    }
+
+    if (!line.startsWith(targetPrefix)) {
+      continue;
+    }
+
+    const raw = line.slice(targetPrefix.length);
+    if (!raw) {
+      return '';
+    }
+
+    if ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"))) {
+      return raw.slice(1, -1);
+    }
+
+    return raw;
+  }
+
+  return null;
+}
+
+function getSteamPassword() {
+  const rawPassword = readRawEnvValue('STEAM_PASSWORD');
+  if (rawPassword !== null) {
+    return rawPassword;
+  }
+
+  return process.env.STEAM_PASSWORD;
+}
+
 function isFriend(steamId64) {
   if (!steamId64 || !client.myFriends) return false;
   return client.myFriends[steamId64] === SteamUser.EFriendRelationship.Friend;
@@ -226,7 +268,7 @@ async function readHistory(limit = 200) {
 
 function buildLogOnOptions() {
   const accountName = process.env.STEAM_ACCOUNT_NAME;
-  const password = process.env.STEAM_PASSWORD;
+  const password = getSteamPassword();
   const refreshToken = process.env.STEAM_REFRESH_TOKEN;
 
   if (!refreshToken && (!accountName || !password)) {

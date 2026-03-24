@@ -33,6 +33,8 @@ Copy-Item .env.example .env
 - 方式 A：`STEAM_REFRESH_TOKEN`
 - 方式 B：`STEAM_ACCOUNT_NAME` + `STEAM_PASSWORD`
 
+如果 `STEAM_PASSWORD` 中包含 `#`，当前程序会按 `.env` 原始值读取，不会被当成注释截断。
+
 ## 3. 启动
 
 ```bash
