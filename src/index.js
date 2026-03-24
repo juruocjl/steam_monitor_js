@@ -243,7 +243,7 @@ function buildLogOnOptions() {
     logOnOptions.accountName = accountName;
     logOnOptions.password = password;
   }
-
+  console.log(logOnOptions);
   return logOnOptions;
 }
 
