@@ -1,0 +1,28 @@
+{
+  "name": "steam_monitor_js",
+  "version": "1.0.0",
+  "description": "Steam 好友游戏状态监视器（node-steam-user）",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/juruocjl/steam_monitor_js.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/juruocjl/steam_monitor_js/issues"
+  },
+  "homepage": "https://github.com/juruocjl/steam_monitor_js#readme",
+  "dependencies": {
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "sqlite3": "^6.0.1",
+    "steam-user": "^5.3.0"
+  }
+}
