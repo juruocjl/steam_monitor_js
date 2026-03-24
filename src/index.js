@@ -225,6 +225,7 @@ function recordGameChange(steamId, gameId) {
 }
 
 function upsertFriendStatus(steamId, user = {}) {
+  console.log(user);
   const gameId = normalizeGameId(user);
   const richPresence = user.rich_presence || {};
   const richPresenceString = user.rich_presence_string || null;
