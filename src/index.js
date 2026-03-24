@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
 const express = require('express');
 const SteamUser = require('steam-user');
 const sqlite3 = require('sqlite3').verbose();
@@ -21,6 +22,9 @@ const client = new SteamUser({
 
 const friendStatuses = new Map();
 const lastRecordedGameByFriend = new Map();
+const gameNameById = new Map();
+const gameIconById = new Map();
+const pendingGameNameFetch = new Set();
 let botSteamId = null;
 let isLoggedOn = false;
 let db = null;
@@ -103,6 +107,15 @@ async function initDatabase() {
     )
   `);
 
+  await dbRun(`
+    CREATE TABLE IF NOT EXISTS game_name_map (
+      game_id INTEGER PRIMARY KEY,
+      game_name TEXT NOT NULL,
+      icon_url TEXT,
+      updated_at TEXT NOT NULL
+    )
+  `);
+
   const columns = await dbAll('PRAGMA table_info(friend_game_history)');
   const hasChangedAt = columns.some((column) => column.name === 'changed_at');
   if (!hasChangedAt) {
@@ -112,7 +125,25 @@ async function initDatabase() {
     ]);
   }
 
+  const gameMapColumns = await dbAll('PRAGMA table_info(game_name_map)');
+  const hasIconUrl = gameMapColumns.some((column) => column.name === 'icon_url');
+  if (!hasIconUrl) {
+    await dbRun('ALTER TABLE game_name_map ADD COLUMN icon_url TEXT');
+  }
+
   await dbRun('CREATE INDEX IF NOT EXISTS idx_history_user_id ON friend_game_history(user_id)');
+  await dbRun('CREATE INDEX IF NOT EXISTS idx_game_name_updated_at ON game_name_map(updated_at)');
+
+  const existingGameMappings = await dbAll(
+    'SELECT game_id AS gameId, game_name AS gameName, icon_url AS iconUrl FROM game_name_map'
+  );
+  for (const row of existingGameMappings) {
+    const gameId = Number(row.gameId);
+    gameNameById.set(gameId, row.gameName);
+    if (row.iconUrl) {
+      gameIconById.set(gameId, row.iconUrl);
+    }
+  }
 }
 
 function toSteamId64(steamID) {
@@ -231,6 +262,136 @@ function buildPartyInfo(richPresence = {}) {
   };
 }
 
+function saveGameMetadata(gameId, gameName, iconUrl = null) {
+  if (!gameId || !gameName) {
+    return;
+  }
+
+  const gameIdNumber = Number(gameId);
+  if (Number.isNaN(gameIdNumber) || gameIdNumber <= 0) {
+    return;
+  }
+
+  gameNameById.set(gameIdNumber, gameName);
+  if (iconUrl) {
+    gameIconById.set(gameIdNumber, iconUrl);
+  }
+
+  dbRun(
+    'INSERT OR REPLACE INTO game_name_map (game_id, game_name, icon_url, updated_at) VALUES (?, ?, ?, ?)',
+    [gameIdNumber, gameName, iconUrl, new Date().toISOString()]
+  ).catch((err) => {
+    console.error('写入游戏元数据映射失败:', err.message);
+  });
+}
+
+function fetchGameMetadataFromStore(gameId) {
+  const gameIdNumber = Number(gameId);
+  if (Number.isNaN(gameIdNumber) || gameIdNumber <= 0) {
+    return Promise.resolve(null);
+  }
+
+  const url = `https://store.steampowered.com/api/appdetails?appids=${gameIdNumber}&l=${encodeURIComponent(
+    STEAM_LANGUAGE
+  )}`;
+
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, (res) => {
+      let body = '';
+
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => {
+        body += chunk;
+      });
+
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(body);
+          const appNode = parsed[String(gameIdNumber)];
+          const gameName = appNode?.data?.name || null;
+          const iconUrl = appNode?.data?.capsule_image || appNode?.data?.header_image || null;
+          resolve({ gameName, iconUrl });
+        } catch (err) {
+          reject(err);
+        }
+      });
+    });
+
+    req.on('error', (err) => {
+      reject(err);
+    });
+
+    req.setTimeout(5000, () => {
+      req.destroy(new Error('请求 Steam 商店超时'));
+    });
+  });
+}
+
+function backfillGameMetadataToStatuses(gameId, gameName, iconUrl) {
+  for (const [steamId, status] of friendStatuses.entries()) {
+    if (status.gameId === gameId && (!status.gameName || !status.gameSmallIcon)) {
+      friendStatuses.set(steamId, {
+        ...status,
+        gameName: status.gameName || gameName,
+        gameSmallIcon: status.gameSmallIcon || iconUrl,
+        updatedAt: new Date().toISOString(),
+      });
+    }
+  }
+}
+
+function ensureGameNameMapping(gameId) {
+  const gameIdNumber = Number(gameId);
+  if (Number.isNaN(gameIdNumber) || gameIdNumber <= 0) {
+    return;
+  }
+
+  if (gameNameById.has(gameIdNumber) || pendingGameNameFetch.has(gameIdNumber)) {
+    return;
+  }
+
+  pendingGameNameFetch.add(gameIdNumber);
+  fetchGameMetadataFromStore(gameIdNumber)
+    .then((meta) => {
+      if (!meta?.gameName) {
+        return;
+      }
+
+      saveGameMetadata(gameIdNumber, meta.gameName, meta.iconUrl || null);
+      backfillGameMetadataToStatuses(gameIdNumber, meta.gameName, meta.iconUrl || null);
+    })
+    .catch((err) => {
+      console.warn(`拉取游戏名失败 appid=${gameIdNumber}:`, err.message);
+    })
+    .finally(() => {
+      pendingGameNameFetch.delete(gameIdNumber);
+    });
+}
+
+function resolveGameName(gameId, directGameName) {
+  const gameIdNumber = Number(gameId || 0);
+  if (!gameIdNumber) {
+    return null;
+  }
+
+  if (directGameName) {
+    const existingIcon = gameIconById.get(gameIdNumber) || null;
+    saveGameMetadata(gameIdNumber, directGameName, existingIcon);
+    return directGameName;
+  }
+
+  return gameNameById.get(gameIdNumber) || null;
+}
+
+function resolveGameIcon(gameId) {
+  const gameIdNumber = Number(gameId || 0);
+  if (!gameIdNumber) {
+    return null;
+  }
+
+  return gameIconById.get(gameIdNumber) || null;
+}
+
 function recordGameChange(steamId, gameId) {
   const lastGameId = lastRecordedGameByFriend.get(steamId);
   if (lastGameId === gameId) {
@@ -249,10 +410,16 @@ function recordGameChange(steamId, gameId) {
 }
 
 function upsertFriendStatus(steamId, user = {}) {
-  console.log(user);
   const gameId = normalizeGameId(user);
   const richPresence = normalizeRichPresenceMap(user.rich_presence);
   const richPresenceString = user.rich_presence_string || null;
+
+  const gameName = resolveGameName(gameId, user.game_name || null);
+  const gameSmallIcon = resolveGameIcon(gameId);
+
+  if (gameId > 0 && !gameName) {
+    ensureGameNameMapping(gameId);
+  }
 
   const status = {
     steamId,
@@ -260,7 +427,8 @@ function upsertFriendStatus(steamId, user = {}) {
     personaStateCode: user.persona_state ?? 0,
     personaStateText: PERSONA_STATE_MAP[user.persona_state] || '未知',
     gameId,
-    gameName: user.game_name || null,
+    gameName,
+    gameSmallIcon,
     richPresenceString,
     richPresence,
     party: buildPartyInfo(richPresence),
@@ -299,7 +467,7 @@ function buildLogOnOptions() {
     logOnOptions.accountName = accountName;
     logOnOptions.password = password;
   }
-  console.log(logOnOptions);
+
   return logOnOptions;
 }
 
@@ -351,6 +519,38 @@ app.get('/api/friends/:steamId/status', (req, res) => {
     });
   }
   return res.json(status);
+});
+
+app.get('/api/apps/:gameId/icon', async (req, res) => {
+  const gameId = Number(req.params.gameId || 0);
+  if (!gameId) {
+    return res.status(400).json({ message: '无效的 gameId' });
+  }
+
+  let gameName = gameNameById.get(gameId) || null;
+  let iconUrl = gameIconById.get(gameId) || null;
+
+  if (!gameName || !iconUrl) {
+    try {
+      const meta = await fetchGameMetadataFromStore(gameId);
+      if (meta?.gameName) {
+        gameName = meta.gameName;
+        iconUrl = meta.iconUrl || null;
+        saveGameMetadata(gameId, gameName, iconUrl);
+      }
+    } catch (err) {
+      return res.status(500).json({
+        message: '拉取游戏图标失败',
+        error: err.message,
+      });
+    }
+  }
+
+  return res.json({
+    gameId,
+    gameName,
+    iconUrl,
+  });
 });
 
 app.get('/api/history', async (req, res) => {

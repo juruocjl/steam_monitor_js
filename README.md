@@ -80,10 +80,27 @@ npm start
 - `personaStateText`
 - `gameId`
 - `gameName`
+- `gameSmallIcon`（小图标 URL）
 - `richPresenceString`（即 `rich_presence_string`，可直接用于展示）
 - `richPresence`（即 `user.rich_presence` 原样返回）
 - `party`（组队信息：`groupId`、`groupSize`、`connect`）
 - `updatedAt`
+
+说明：当 `gameName` 或 `gameSmallIcon` 为空时，服务会根据 `gameId` 自动维护映射（本地 SQLite 缓存 + Steam 商店接口补全）。
+
+### 按游戏获取小图标
+
+`GET /api/apps/:gameId/icon`
+
+返回示例：
+
+```json
+{
+  "gameId": 570,
+  "gameName": "Dota 2",
+  "iconUrl": "https://cdn.cloudflare.steamstatic.com/steam/apps/570/capsule_184x69.jpg"
+}
+```
 
 说明：如果 `user.rich_presence` 是 `[{ key, value }]` 数组格式，服务会先自动转换成字典对象，再用于 `richPresence` 返回和 `party` 解析。
 
