@@ -35,6 +35,12 @@ Copy-Item .env.example .env
 
 如果 `STEAM_PASSWORD` 中包含 `#`，当前程序会按 `.env` 原始值读取，不会被当成注释截断。
 
+可选语言配置：
+
+- `STEAM_LANGUAGE=schinese`（默认，简体中文）
+
+这会影响 `rich_presence_string` 等本地化文本。
+
 ## 3. 启动
 
 ```bash
@@ -75,7 +81,7 @@ npm start
 - `gameId`
 - `gameName`
 - `richPresenceString`（即 `rich_presence_string`，可直接用于展示）
-- `richPresence`（富文本相关原始字段 + 文本提示）
+- `richPresence`（即 `user.rich_presence` 原样返回）
 - `party`（组队信息：`groupId`、`groupSize`、`connect`）
 - `updatedAt`
 

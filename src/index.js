@@ -9,12 +9,14 @@ const PORT = Number(process.env.PORT || 3000);
 const DATA_DIR = path.join(process.cwd(), 'data');
 const DB_FILE = process.env.SQLITE_DB_PATH || path.join(DATA_DIR, 'friend_game_history.db');
 const ENV_FILE = path.join(process.cwd(), '.env');
+const STEAM_LANGUAGE = process.env.STEAM_LANGUAGE || 'schinese';
 
 const app = express();
 const client = new SteamUser({
   autoRelogin: true,
   renewRefreshTokens: true,
   enablePicsCache: true,
+  language: STEAM_LANGUAGE,
 });
 
 const friendStatuses = new Map();
@@ -196,21 +198,6 @@ function normalizeGameId(user) {
   return Number.isNaN(parsed) ? 0 : parsed;
 }
 
-function normalizeRichPresence(richPresence = {}) {
-  const text = [];
-  for (const [key, value] of Object.entries(richPresence)) {
-    if (!key.startsWith('steam_') && typeof value === 'string' && value.trim() !== '') {
-      text.push(`${key}: ${value}`);
-    }
-  }
-
-  return {
-    raw: richPresence,
-    displayTemplate: richPresence.steam_display || null,
-    textHints: text,
-  };
-}
-
 function buildPartyInfo(richPresence = {}) {
   const groupSize = Number(richPresence.steam_player_group_size || 0);
   return {
@@ -250,7 +237,7 @@ function upsertFriendStatus(steamId, user = {}) {
     gameId,
     gameName: user.game_name || null,
     richPresenceString,
-    richPresence: normalizeRichPresence(richPresence),
+    richPresence,
     party: buildPartyInfo(richPresence),
     updatedAt: new Date().toISOString(),
   };
