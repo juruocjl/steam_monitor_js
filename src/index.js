@@ -3,7 +3,7 @@ const path = require('path');
 const https = require('https');
 const express = require('express');
 const SteamUser = require('steam-user');
-const { HttpsProxyAgent } = require('https-proxy-agent');
+const { HttpsProxyAgent } = require('hpagent');
 const sqlite3 = require('sqlite3').verbose();
 require('dotenv').config();
 
@@ -29,6 +29,7 @@ const friendStatuses = new Map();
 const lastRecordedGameByFriend = new Map();
 const gameNameById = new Map();
 const gameIconById = new Map();
+const proxyAgentByUrl = new Map();
 const pendingGameNameFetch = new Set();
 let botSteamId = null;
 let isLoggedOn = false;
@@ -296,6 +297,27 @@ function sleep(ms) {
   });
 }
 
+function getProxyAgent(proxyUrl) {
+  if (!proxyUrl) {
+    return null;
+  }
+
+  if (proxyAgentByUrl.has(proxyUrl)) {
+    return proxyAgentByUrl.get(proxyUrl);
+  }
+
+  const agent = new HttpsProxyAgent({
+    proxy: proxyUrl,
+    keepAlive: true,
+    keepAliveMsecs: 30000,
+    maxSockets: 32,
+    maxFreeSockets: 8,
+  });
+
+  proxyAgentByUrl.set(proxyUrl, agent);
+  return agent;
+}
+
 function fetchGameMetadataFromStoreOnce(gameId, options = {}) {
   const gameIdNumber = Number(gameId);
   if (Number.isNaN(gameIdNumber) || gameIdNumber <= 0) {
@@ -309,7 +331,7 @@ function fetchGameMetadataFromStoreOnce(gameId, options = {}) {
   return new Promise((resolve, reject) => {
     const requestOptions = {};
     if (options.proxy) {
-      requestOptions.agent = new HttpsProxyAgent(options.proxy);
+      requestOptions.agent = getProxyAgent(options.proxy);
     }
 
     const req = https.get(url, requestOptions, (res) => {
