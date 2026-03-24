@@ -198,6 +198,30 @@ function normalizeGameId(user) {
   return Number.isNaN(parsed) ? 0 : parsed;
 }
 
+function normalizeRichPresenceMap(richPresence) {
+  if (!richPresence) {
+    return {};
+  }
+
+  if (Array.isArray(richPresence)) {
+    const mapped = {};
+    for (const item of richPresence) {
+      if (!item || typeof item.key !== 'string') {
+        continue;
+      }
+
+      mapped[item.key] = item.value;
+    }
+    return mapped;
+  }
+
+  if (typeof richPresence === 'object') {
+    return richPresence;
+  }
+
+  return {};
+}
+
 function buildPartyInfo(richPresence = {}) {
   const groupSize = Number(richPresence.steam_player_group_size || 0);
   return {
@@ -227,7 +251,7 @@ function recordGameChange(steamId, gameId) {
 function upsertFriendStatus(steamId, user = {}) {
   console.log(user);
   const gameId = normalizeGameId(user);
-  const richPresence = user.rich_presence || {};
+  const richPresence = normalizeRichPresenceMap(user.rich_presence);
   const richPresenceString = user.rich_presence_string || null;
 
   const status = {

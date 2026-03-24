@@ -85,6 +85,8 @@ npm start
 - `party`（组队信息：`groupId`、`groupSize`、`connect`）
 - `updatedAt`
 
+说明：如果 `user.rich_presence` 是 `[{ key, value }]` 数组格式，服务会先自动转换成字典对象，再用于 `richPresence` 返回和 `party` 解析。
+
 ### 单个好友状态
 
 `GET /api/friends/:steamId/status`
