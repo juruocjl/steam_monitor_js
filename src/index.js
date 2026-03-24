@@ -240,6 +240,7 @@ function recordGameChange(steamId, gameId) {
 function upsertFriendStatus(steamId, user = {}) {
   const gameId = normalizeGameId(user);
   const richPresence = user.rich_presence || {};
+  const richPresenceString = user.rich_presence_string || null;
 
   const status = {
     steamId,
@@ -248,6 +249,7 @@ function upsertFriendStatus(steamId, user = {}) {
     personaStateText: PERSONA_STATE_MAP[user.persona_state] || '未知',
     gameId,
     gameName: user.game_name || null,
+    richPresenceString,
     richPresence: normalizeRichPresence(richPresence),
     party: buildPartyInfo(richPresence),
     updatedAt: new Date().toISOString(),
