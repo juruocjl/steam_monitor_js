@@ -3,6 +3,7 @@ const path = require('path');
 const https = require('https');
 const express = require('express');
 const SteamUser = require('steam-user');
+const { HttpsProxyAgent } = require('https-proxy-agent');
 const sqlite3 = require('sqlite3').verbose();
 require('dotenv').config();
 
@@ -11,6 +12,10 @@ const DATA_DIR = path.join(process.cwd(), 'data');
 const DB_FILE = process.env.SQLITE_DB_PATH || path.join(DATA_DIR, 'friend_game_history.db');
 const ENV_FILE = path.join(process.cwd(), '.env');
 const STEAM_LANGUAGE = process.env.STEAM_LANGUAGE || 'schinese';
+const STEAM_STORE_TIMEOUT_MS = Number(process.env.STEAM_STORE_TIMEOUT_MS || 5000);
+const STEAM_STORE_RETRY_TIMES = Number(process.env.STEAM_STORE_RETRY_TIMES || 3);
+const STEAM_STORE_RETRY_DELAY_MS = Number(process.env.STEAM_STORE_RETRY_DELAY_MS || 800);
+const STORE_PROXY = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || null;
 
 const app = express();
 const client = new SteamUser({
@@ -285,7 +290,13 @@ function saveGameMetadata(gameId, gameName, iconUrl = null) {
   });
 }
 
-function fetchGameMetadataFromStore(gameId) {
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function fetchGameMetadataFromStoreOnce(gameId, options = {}) {
   const gameIdNumber = Number(gameId);
   if (Number.isNaN(gameIdNumber) || gameIdNumber <= 0) {
     return Promise.resolve(null);
@@ -296,7 +307,12 @@ function fetchGameMetadataFromStore(gameId) {
   )}`;
 
   return new Promise((resolve, reject) => {
-    const req = https.get(url, (res) => {
+    const requestOptions = {};
+    if (options.proxy) {
+      requestOptions.agent = new HttpsProxyAgent(options.proxy);
+    }
+
+    const req = https.get(url, requestOptions, (res) => {
       let body = '';
 
       res.setEncoding('utf8');
@@ -321,10 +337,31 @@ function fetchGameMetadataFromStore(gameId) {
       reject(err);
     });
 
-    req.setTimeout(5000, () => {
+    req.setTimeout(options.timeoutMs || STEAM_STORE_TIMEOUT_MS, () => {
       req.destroy(new Error('请求 Steam 商店超时'));
     });
   });
+}
+
+async function fetchGameMetadataFromStore(gameId) {
+  const retries = Math.max(1, STEAM_STORE_RETRY_TIMES);
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= retries; attempt += 1) {
+    try {
+      return await fetchGameMetadataFromStoreOnce(gameId, {
+        proxy: STORE_PROXY,
+        timeoutMs: STEAM_STORE_TIMEOUT_MS,
+      });
+    } catch (err) {
+      lastError = err;
+      if (attempt < retries) {
+        await sleep(STEAM_STORE_RETRY_DELAY_MS * attempt);
+      }
+    }
+  }
+
+  throw lastError || new Error('拉取游戏元数据失败');
 }
 
 function backfillGameMetadataToStatuses(gameId, gameName, iconUrl) {
