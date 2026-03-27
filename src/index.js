@@ -675,6 +675,20 @@ function upsertFriendStatus(steamId, user = {}) {
   recordGameChange(steamId, gameId);
 }
 
+function normalizeStatusForApi(status) {
+  if (!status) {
+    return status;
+  }
+
+  const normalizedGameId = normalizeGameIdKey(status.gameId);
+  return {
+    ...status,
+    gameId: normalizedGameId,
+    gameName: normalizedGameId ? status.gameName : null,
+    gameSmallIcon: normalizedGameId ? status.gameSmallIcon : null,
+  };
+}
+
 async function readHistory(limit = 200) {
   const rows = await dbAll(
     'SELECT user_id AS userId, game_id AS gameId, changed_at AS changedAt FROM friend_game_history ORDER BY id DESC LIMIT ?',
@@ -745,7 +759,9 @@ app.get('/api/health', (req, res) => {
 });
 
 app.get('/api/friends/status', (req, res) => {
-  const statuses = Array.from(friendStatuses.values()).sort((a, b) => a.steamId.localeCompare(b.steamId));
+  const statuses = Array.from(friendStatuses.values())
+    .map((status) => normalizeStatusForApi(status))
+    .sort((a, b) => a.steamId.localeCompare(b.steamId));
   res.json({
     total: statuses.length,
     data: statuses,
@@ -753,7 +769,7 @@ app.get('/api/friends/status', (req, res) => {
 });
 
 app.get('/api/friends/:steamId/status', (req, res) => {
-  const status = friendStatuses.get(req.params.steamId);
+  const status = normalizeStatusForApi(friendStatuses.get(req.params.steamId));
   if (!status) {
     return res.status(404).json({
       message: '未找到该好友状态，可能不是好友或尚未收到状态更新',
