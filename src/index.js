@@ -16,6 +16,8 @@ const STEAM_STORE_TIMEOUT_MS = Number(process.env.STEAM_STORE_TIMEOUT_MS || 5000
 const STEAM_STORE_RETRY_TIMES = Number(process.env.STEAM_STORE_RETRY_TIMES || 3);
 const STEAM_STORE_RETRY_DELAY_MS = Number(process.env.STEAM_STORE_RETRY_DELAY_MS || 800);
 const STORE_PROXY = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || null;
+const STEAM_RECONNECT_BASE_MS = Number(process.env.STEAM_RECONNECT_BASE_MS || 2000);
+const STEAM_RECONNECT_MAX_MS = Number(process.env.STEAM_RECONNECT_MAX_MS || 60000);
 
 const app = express();
 const client = new SteamUser({
@@ -33,7 +35,11 @@ const proxyAgentByUrl = new Map();
 const pendingGameNameFetch = new Set();
 let botSteamId = null;
 let isLoggedOn = false;
+let isLoggingOn = false;
+let reconnectTimer = null;
+let reconnectAttempt = 0;
 let db = null;
+let cachedLogOnOptions = null;
 
 const PERSONA_STATE_MAP = {
   0: '离线',
@@ -45,6 +51,78 @@ const PERSONA_STATE_MAP = {
   6: '想玩游戏',
   7: '隐身',
 };
+
+function normalizeGameIdKey(gameId) {
+  if (gameId === undefined || gameId === null) {
+    return '0';
+  }
+
+  const key = String(gameId).trim();
+  return key === '' ? '0' : key;
+}
+
+function clearReconnectTimer() {
+  if (!reconnectTimer) {
+    return;
+  }
+
+  clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+}
+
+function doLogOn(reason) {
+  if (!cachedLogOnOptions) {
+    console.warn('未找到登录参数，无法执行自动重连。');
+    return;
+  }
+
+  if (isLoggedOn || isLoggingOn) {
+    return;
+  }
+
+  isLoggingOn = true;
+  try {
+    console.log(`正在尝试 Steam 登录: ${reason}`);
+    client.logOn(cachedLogOnOptions);
+  } catch (err) {
+    isLoggingOn = false;
+    console.error('触发登录失败:', err.message);
+    scheduleReconnect('logOn异常');
+  }
+}
+
+function scheduleReconnect(reason) {
+  if (isLoggedOn || isLoggingOn || reconnectTimer) {
+    return;
+  }
+
+  reconnectAttempt += 1;
+  const delay = Math.min(STEAM_RECONNECT_BASE_MS * 2 ** (reconnectAttempt - 1), STEAM_RECONNECT_MAX_MS);
+  console.warn(`已计划第 ${reconnectAttempt} 次重连，${delay}ms 后执行，原因: ${reason}`);
+
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    doLogOn(`重连第${reconnectAttempt}次`);
+  }, delay);
+}
+
+function getStoreAppId(gameId) {
+  const gameIdKey = normalizeGameIdKey(gameId);
+  if (gameIdKey === '0') {
+    return null;
+  }
+
+  if (!/^\d+$/.test(gameIdKey)) {
+    return null;
+  }
+
+  const asNumber = Number(gameIdKey);
+  if (!Number.isSafeInteger(asNumber) || asNumber <= 0) {
+    return null;
+  }
+
+  return asNumber;
+}
 
 function ensureStorage() {
   if (!fs.existsSync(DATA_DIR)) {
@@ -104,18 +182,78 @@ function dbAll(sql, params = []) {
 
 async function initDatabase() {
   await openDatabase();
+
+  const historyTable = await dbAll(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='friend_game_history'"
+  );
+  if (historyTable.length > 0) {
+    const historyColumns = await dbAll('PRAGMA table_info(friend_game_history)');
+    const gameIdColumn = historyColumns.find((column) => column.name === 'game_id');
+    const needsHistoryRebuild = !gameIdColumn || String(gameIdColumn.type || '').toUpperCase() !== 'TEXT';
+    if (needsHistoryRebuild) {
+      await dbRun('ALTER TABLE friend_game_history RENAME TO friend_game_history_old');
+      await dbRun(`
+        CREATE TABLE friend_game_history (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL,
+          game_id TEXT NOT NULL,
+          changed_at TEXT NOT NULL
+        )
+      `);
+      await dbRun(`
+        INSERT INTO friend_game_history (id, user_id, game_id, changed_at)
+        SELECT id, user_id, CAST(game_id AS TEXT), COALESCE(changed_at, datetime('now'))
+        FROM friend_game_history_old
+      `);
+      await dbRun('DROP TABLE friend_game_history_old');
+    }
+  }
+
   await dbRun(`
     CREATE TABLE IF NOT EXISTS friend_game_history (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id TEXT NOT NULL,
-      game_id INTEGER NOT NULL,
+      game_id TEXT NOT NULL,
       changed_at TEXT NOT NULL
     )
   `);
 
+  const gameMapTable = await dbAll(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='game_name_map'"
+  );
+  if (gameMapTable.length > 0) {
+    const gameMapColumns = await dbAll('PRAGMA table_info(game_name_map)');
+    const gameIdColumn = gameMapColumns.find((column) => column.name === 'game_id');
+    const hasIconUrl = gameMapColumns.some((column) => column.name === 'icon_url');
+    const hasUpdatedAt = gameMapColumns.some((column) => column.name === 'updated_at');
+    const needsGameMapRebuild = !gameIdColumn || String(gameIdColumn.type || '').toUpperCase() !== 'TEXT';
+
+    if (needsGameMapRebuild) {
+      await dbRun('ALTER TABLE game_name_map RENAME TO game_name_map_old');
+      await dbRun(`
+        CREATE TABLE game_name_map (
+          game_id TEXT PRIMARY KEY,
+          game_name TEXT NOT NULL,
+          icon_url TEXT,
+          updated_at TEXT NOT NULL
+        )
+      `);
+
+      const iconExpr = hasIconUrl ? 'icon_url' : 'NULL';
+      const updatedExpr = hasUpdatedAt ? 'updated_at' : "datetime('now')";
+
+      await dbRun(`
+        INSERT INTO game_name_map (game_id, game_name, icon_url, updated_at)
+        SELECT CAST(game_id AS TEXT), game_name, ${iconExpr}, COALESCE(${updatedExpr}, datetime('now'))
+        FROM game_name_map_old
+      `);
+      await dbRun('DROP TABLE game_name_map_old');
+    }
+  }
+
   await dbRun(`
     CREATE TABLE IF NOT EXISTS game_name_map (
-      game_id INTEGER PRIMARY KEY,
+      game_id TEXT PRIMARY KEY,
       game_name TEXT NOT NULL,
       icon_url TEXT,
       updated_at TEXT NOT NULL
@@ -131,9 +269,9 @@ async function initDatabase() {
     ]);
   }
 
-  const gameMapColumns = await dbAll('PRAGMA table_info(game_name_map)');
-  const hasIconUrl = gameMapColumns.some((column) => column.name === 'icon_url');
-  if (!hasIconUrl) {
+  const gameMapColumnsAfterInit = await dbAll('PRAGMA table_info(game_name_map)');
+  const hasIconUrlAfterInit = gameMapColumnsAfterInit.some((column) => column.name === 'icon_url');
+  if (!hasIconUrlAfterInit) {
     await dbRun('ALTER TABLE game_name_map ADD COLUMN icon_url TEXT');
   }
 
@@ -144,7 +282,7 @@ async function initDatabase() {
     'SELECT game_id AS gameId, game_name AS gameName, icon_url AS iconUrl FROM game_name_map'
   );
   for (const row of existingGameMappings) {
-    const gameId = Number(row.gameId);
+    const gameId = normalizeGameIdKey(row.gameId);
     gameNameById.set(gameId, row.gameName);
     if (row.iconUrl) {
       gameIconById.set(gameId, row.iconUrl);
@@ -230,9 +368,8 @@ function isFriend(steamId64) {
 
 function normalizeGameId(user) {
   const value = user?.gameid_real || user?.gameid;
-  if (!value) return 0;
-  const parsed = Number(value);
-  return Number.isNaN(parsed) ? 0 : parsed;
+  if (!value) return '0';
+  return normalizeGameIdKey(value);
 }
 
 function normalizeRichPresenceMap(richPresence) {
@@ -273,19 +410,19 @@ function saveGameMetadata(gameId, gameName, iconUrl = null) {
     return;
   }
 
-  const gameIdNumber = Number(gameId);
-  if (Number.isNaN(gameIdNumber) || gameIdNumber <= 0) {
+  const gameIdKey = normalizeGameIdKey(gameId);
+  if (gameIdKey === '0') {
     return;
   }
 
-  gameNameById.set(gameIdNumber, gameName);
+  gameNameById.set(gameIdKey, gameName);
   if (iconUrl) {
-    gameIconById.set(gameIdNumber, iconUrl);
+    gameIconById.set(gameIdKey, iconUrl);
   }
 
   dbRun(
     'INSERT OR REPLACE INTO game_name_map (game_id, game_name, icon_url, updated_at) VALUES (?, ?, ?, ?)',
-    [gameIdNumber, gameName, iconUrl, new Date().toISOString()]
+    [gameIdKey, gameName, iconUrl, new Date().toISOString()]
   ).catch((err) => {
     console.error('写入游戏元数据映射失败:', err.message);
   });
@@ -319,8 +456,8 @@ function getProxyAgent(proxyUrl) {
 }
 
 function fetchGameMetadataFromStoreOnce(gameId, options = {}) {
-  const gameIdNumber = Number(gameId);
-  if (Number.isNaN(gameIdNumber) || gameIdNumber <= 0) {
+  const gameIdNumber = getStoreAppId(gameId);
+  if (!gameIdNumber) {
     return Promise.resolve(null);
   }
 
@@ -387,8 +524,9 @@ async function fetchGameMetadataFromStore(gameId) {
 }
 
 function backfillGameMetadataToStatuses(gameId, gameName, iconUrl) {
+  const gameIdKey = normalizeGameIdKey(gameId);
   for (const [steamId, status] of friendStatuses.entries()) {
-    if (status.gameId === gameId && (!status.gameName || !status.gameSmallIcon)) {
+    if (status.gameId === gameIdKey && (!status.gameName || !status.gameSmallIcon)) {
       friendStatuses.set(steamId, {
         ...status,
         gameName: status.gameName || gameName,
@@ -400,55 +538,55 @@ function backfillGameMetadataToStatuses(gameId, gameName, iconUrl) {
 }
 
 function ensureGameNameMapping(gameId) {
-  const gameIdNumber = Number(gameId);
-  if (Number.isNaN(gameIdNumber) || gameIdNumber <= 0) {
+  const gameIdKey = normalizeGameIdKey(gameId);
+  if (gameIdKey === '0') {
     return;
   }
 
-  if (gameNameById.has(gameIdNumber) || pendingGameNameFetch.has(gameIdNumber)) {
+  if (gameNameById.has(gameIdKey) || pendingGameNameFetch.has(gameIdKey)) {
     return;
   }
 
-  pendingGameNameFetch.add(gameIdNumber);
-  fetchGameMetadataFromStore(gameIdNumber)
+  pendingGameNameFetch.add(gameIdKey);
+  fetchGameMetadataFromStore(gameIdKey)
     .then((meta) => {
       if (!meta?.gameName) {
         return;
       }
 
-      saveGameMetadata(gameIdNumber, meta.gameName, meta.iconUrl || null);
-      backfillGameMetadataToStatuses(gameIdNumber, meta.gameName, meta.iconUrl || null);
+      saveGameMetadata(gameIdKey, meta.gameName, meta.iconUrl || null);
+      backfillGameMetadataToStatuses(gameIdKey, meta.gameName, meta.iconUrl || null);
     })
     .catch((err) => {
-      console.warn(`拉取游戏名失败 appid=${gameIdNumber}:`, err.message);
+      console.warn(`拉取游戏名失败 appid=${gameIdKey}:`, err.message);
     })
     .finally(() => {
-      pendingGameNameFetch.delete(gameIdNumber);
+      pendingGameNameFetch.delete(gameIdKey);
     });
 }
 
 function resolveGameName(gameId, directGameName) {
-  const gameIdNumber = Number(gameId || 0);
-  if (!gameIdNumber) {
+  const gameIdKey = normalizeGameIdKey(gameId);
+  if (gameIdKey === '0') {
     return null;
   }
 
   if (directGameName) {
-    const existingIcon = gameIconById.get(gameIdNumber) || null;
-    saveGameMetadata(gameIdNumber, directGameName, existingIcon);
+    const existingIcon = gameIconById.get(gameIdKey) || null;
+    saveGameMetadata(gameIdKey, directGameName, existingIcon);
     return directGameName;
   }
 
-  return gameNameById.get(gameIdNumber) || null;
+  return gameNameById.get(gameIdKey) || null;
 }
 
 function resolveGameIcon(gameId) {
-  const gameIdNumber = Number(gameId || 0);
-  if (!gameIdNumber) {
+  const gameIdKey = normalizeGameIdKey(gameId);
+  if (gameIdKey === '0') {
     return null;
   }
 
-  return gameIconById.get(gameIdNumber) || null;
+  return gameIconById.get(gameIdKey) || null;
 }
 
 function recordGameChange(steamId, gameId) {
@@ -476,7 +614,7 @@ function upsertFriendStatus(steamId, user = {}) {
   const gameName = resolveGameName(gameId, user.game_name || null);
   const gameSmallIcon = resolveGameIcon(gameId);
 
-  if (gameId > 0 && !gameName) {
+  if (gameId !== '0' && !gameName) {
     ensureGameNameMapping(gameId);
   }
 
@@ -581,8 +719,8 @@ app.get('/api/friends/:steamId/status', (req, res) => {
 });
 
 app.get('/api/apps/:gameId/icon', async (req, res) => {
-  const gameId = Number(req.params.gameId || 0);
-  if (!gameId) {
+  const gameId = normalizeGameIdKey(req.params.gameId);
+  if (gameId === '0') {
     return res.status(400).json({ message: '无效的 gameId' });
   }
 
@@ -632,6 +770,9 @@ app.get('/api/history', async (req, res) => {
 
 client.on('loggedOn', () => {
   isLoggedOn = true;
+  isLoggingOn = false;
+  reconnectAttempt = 0;
+  clearReconnectTimer();
   botSteamId = toSteamId64(client.steamID);
   console.log('Steam 登录成功，机器人 SteamID:', botSteamId);
 
@@ -644,12 +785,16 @@ client.on('refreshToken', (token) => {
 });
 
 client.on('error', (err) => {
+  isLoggingOn = false;
   console.error('Steam 客户端错误:', err.message);
+  scheduleReconnect(`error:${err.message}`);
 });
 
 client.on('disconnected', (eresult, msg) => {
   isLoggedOn = false;
+  isLoggingOn = false;
   console.warn(`Steam 连接断开: ${eresult} - ${msg || '无附加信息'}`);
+  scheduleReconnect(`disconnected:${eresult}`);
 });
 
 client.on('friendRelationship', (steamID, relationship) => {
@@ -693,9 +838,8 @@ async function start() {
   ensureStorage();
   await initDatabase();
 
-  const logOnOptions = buildLogOnOptions();
-  console.log('正在登录 Steam...');
-  client.logOn(logOnOptions);
+  cachedLogOnOptions = buildLogOnOptions();
+  doLogOn('初次启动');
 
   app.listen(PORT, () => {
     console.log(`API 服务已启动: http://localhost:${PORT}`);
