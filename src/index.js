@@ -54,11 +54,15 @@ const PERSONA_STATE_MAP = {
 
 function normalizeGameIdKey(gameId) {
   if (gameId === undefined || gameId === null) {
-    return '0';
+    return '';
   }
 
   const key = String(gameId).trim();
-  return key === '' ? '0' : key;
+  if (key === '' || key === '0') {
+    return '';
+  }
+
+  return key;
 }
 
 function clearReconnectTimer() {
@@ -108,7 +112,7 @@ function scheduleReconnect(reason) {
 
 function getStoreAppId(gameId) {
   const gameIdKey = normalizeGameIdKey(gameId);
-  if (gameIdKey === '0') {
+  if (!gameIdKey) {
     return null;
   }
 
@@ -411,7 +415,7 @@ function saveGameMetadata(gameId, gameName, iconUrl = null) {
   }
 
   const gameIdKey = normalizeGameIdKey(gameId);
-  if (gameIdKey === '0') {
+  if (!gameIdKey) {
     return;
   }
 
@@ -539,7 +543,7 @@ function backfillGameMetadataToStatuses(gameId, gameName, iconUrl) {
 
 function ensureGameNameMapping(gameId) {
   const gameIdKey = normalizeGameIdKey(gameId);
-  if (gameIdKey === '0') {
+  if (!gameIdKey) {
     return;
   }
 
@@ -567,7 +571,7 @@ function ensureGameNameMapping(gameId) {
 
 function resolveGameName(gameId, directGameName) {
   const gameIdKey = normalizeGameIdKey(gameId);
-  if (gameIdKey === '0') {
+  if (!gameIdKey) {
     return null;
   }
 
@@ -582,7 +586,7 @@ function resolveGameName(gameId, directGameName) {
 
 function resolveGameIcon(gameId) {
   const gameIdKey = normalizeGameIdKey(gameId);
-  if (gameIdKey === '0') {
+  if (!gameIdKey) {
     return null;
   }
 
@@ -614,7 +618,7 @@ function upsertFriendStatus(steamId, user = {}) {
   const gameName = resolveGameName(gameId, user.game_name || null);
   const gameSmallIcon = resolveGameIcon(gameId);
 
-  if (gameId !== '0' && !gameName) {
+  if (gameId && !gameName) {
     ensureGameNameMapping(gameId);
   }
 
@@ -720,7 +724,7 @@ app.get('/api/friends/:steamId/status', (req, res) => {
 
 app.get('/api/apps/:gameId/icon', async (req, res) => {
   const gameId = normalizeGameIdKey(req.params.gameId);
-  if (gameId === '0') {
+  if (!gameId) {
     return res.status(400).json({ message: '无效的 gameId' });
   }
 
