@@ -41,6 +41,11 @@ Copy-Item .env.example .env
 
 这会影响 `rich_presence_string` 等本地化文本。
 
+登录稳定性配置：
+
+- `STEAM_LOGIN_TIMEOUT_MS`：登录超时自动重试阈值（默认 30000）
+- `STEAM_GUARD_CODE`：可选，一次性 Steam Guard 验证码（更推荐使用 `STEAM_REFRESH_TOKEN`）
+
 如果网络环境导致 Steam 商店接口超时，可配置：
 
 - `HTTPS_PROXY`：请求代理地址

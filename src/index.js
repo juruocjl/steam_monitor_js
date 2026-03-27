@@ -18,6 +18,8 @@ const STEAM_STORE_RETRY_DELAY_MS = Number(process.env.STEAM_STORE_RETRY_DELAY_MS
 const STORE_PROXY = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || null;
 const STEAM_RECONNECT_BASE_MS = Number(process.env.STEAM_RECONNECT_BASE_MS || 2000);
 const STEAM_RECONNECT_MAX_MS = Number(process.env.STEAM_RECONNECT_MAX_MS || 60000);
+const STEAM_LOGIN_TIMEOUT_MS = Number(process.env.STEAM_LOGIN_TIMEOUT_MS || 30000);
+const STEAM_GUARD_CODE = process.env.STEAM_GUARD_CODE || '';
 
 const app = express();
 const client = new SteamUser({
@@ -37,6 +39,7 @@ let botSteamId = null;
 let isLoggedOn = false;
 let isLoggingOn = false;
 let reconnectTimer = null;
+let loginTimeoutTimer = null;
 let reconnectAttempt = 0;
 let db = null;
 let cachedLogOnOptions = null;
@@ -74,6 +77,29 @@ function clearReconnectTimer() {
   reconnectTimer = null;
 }
 
+function clearLoginTimeoutTimer() {
+  if (!loginTimeoutTimer) {
+    return;
+  }
+
+  clearTimeout(loginTimeoutTimer);
+  loginTimeoutTimer = null;
+}
+
+function armLoginTimeout() {
+  clearLoginTimeoutTimer();
+
+  loginTimeoutTimer = setTimeout(() => {
+    if (isLoggedOn) {
+      return;
+    }
+
+    isLoggingOn = false;
+    console.warn(`Steam 登录超时（>${STEAM_LOGIN_TIMEOUT_MS}ms），准备重试。`);
+    scheduleReconnect('login-timeout');
+  }, Math.max(5000, STEAM_LOGIN_TIMEOUT_MS));
+}
+
 function doLogOn(reason) {
   if (!cachedLogOnOptions) {
     console.warn('未找到登录参数，无法执行自动重连。');
@@ -85,10 +111,12 @@ function doLogOn(reason) {
   }
 
   isLoggingOn = true;
+  armLoginTimeout();
   try {
     console.log(`正在尝试 Steam 登录: ${reason}`);
     client.logOn(cachedLogOnOptions);
   } catch (err) {
+    clearLoginTimeoutTimer();
     isLoggingOn = false;
     console.error('触发登录失败:', err.message);
     scheduleReconnect('logOn异常');
@@ -787,6 +815,7 @@ app.get('/api/history', async (req, res) => {
 client.on('loggedOn', () => {
   isLoggedOn = true;
   isLoggingOn = false;
+  clearLoginTimeoutTimer();
   reconnectAttempt = 0;
   clearReconnectTimer();
   botSteamId = toSteamId64(client.steamID);
@@ -802,6 +831,7 @@ client.on('refreshToken', (token) => {
 
 client.on('error', (err) => {
   isLoggingOn = false;
+  clearLoginTimeoutTimer();
   console.error('Steam 客户端错误:', err.message);
   scheduleReconnect(`error:${err.message}`);
 });
@@ -809,8 +839,26 @@ client.on('error', (err) => {
 client.on('disconnected', (eresult, msg) => {
   isLoggedOn = false;
   isLoggingOn = false;
+  clearLoginTimeoutTimer();
   console.warn(`Steam 连接断开: ${eresult} - ${msg || '无附加信息'}`);
   scheduleReconnect(`disconnected:${eresult}`);
+});
+
+client.on('steamGuard', (domain, callback) => {
+  const hint = domain || '未知域名';
+  if (STEAM_GUARD_CODE) {
+    console.warn(`触发 Steam Guard（${hint}），使用 STEAM_GUARD_CODE 提交验证码。`);
+    callback(STEAM_GUARD_CODE);
+    return;
+  }
+
+  console.error(
+    `触发 Steam Guard（${hint}），但未配置 STEAM_GUARD_CODE。请改用 STEAM_REFRESH_TOKEN 或在 .env 填写 STEAM_GUARD_CODE。`
+  );
+  isLoggingOn = false;
+  clearLoginTimeoutTimer();
+  scheduleReconnect('steam-guard-required');
+  callback('');
 });
 
 client.on('friendRelationship', (steamID, relationship) => {
