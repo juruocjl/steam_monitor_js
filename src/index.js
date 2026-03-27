@@ -39,6 +39,7 @@ const proxyAgentByUrl = new Map();
 const pendingGameNameFetch = new Set();
 let botSteamId = null;
 let isLoggedOn = false;
+let hasFriendStatusReady = false;
 let isLoggingOn = false;
 let reconnectTimer = null;
 let loginTimeoutTimer = null;
@@ -757,6 +758,7 @@ function hydrateFriendStatuses() {
     .map(([steamId]) => steamId);
 
   if (friendIds.length === 0) {
+    hasFriendStatusReady = true;
     return;
   }
 
@@ -767,6 +769,8 @@ function hydrateFriendStatuses() {
         upsertFriendStatus(friendId, user);
       }
     });
+
+    hasFriendStatusReady = true;
   });
 }
 
@@ -774,12 +778,21 @@ app.get('/api/health', (req, res) => {
   res.json({
     ok: true,
     loggedOn: isLoggedOn,
+    friendStatusReady: hasFriendStatusReady,
     botSteamId,
     friendCount: friendStatuses.size,
   });
 });
 
 app.get('/api/friends/status', (req, res) => {
+  if (!isLoggedOn || !hasFriendStatusReady) {
+    return res.status(503).json({
+      message: '好友状态尚未就绪，请等待登录并完成首次好友信息拉取',
+      loggedOn: isLoggedOn,
+      friendStatusReady: hasFriendStatusReady,
+    });
+  }
+
   const statuses = Array.from(friendStatuses.values())
     .map((status) => normalizeStatusForApi(status))
     .sort((a, b) => a.steamId.localeCompare(b.steamId));
@@ -790,6 +803,14 @@ app.get('/api/friends/status', (req, res) => {
 });
 
 app.get('/api/friends/:steamId/status', (req, res) => {
+  if (!isLoggedOn || !hasFriendStatusReady) {
+    return res.status(503).json({
+      message: '好友状态尚未就绪，请等待登录并完成首次好友信息拉取',
+      loggedOn: isLoggedOn,
+      friendStatusReady: hasFriendStatusReady,
+    });
+  }
+
   const status = normalizeStatusForApi(friendStatuses.get(req.params.steamId));
   if (!status) {
     return res.status(404).json({
@@ -851,6 +872,7 @@ app.get('/api/history', async (req, res) => {
 
 client.on('loggedOn', () => {
   isLoggedOn = true;
+  hasFriendStatusReady = false;
   isLoggingOn = false;
   clearLoginTimeoutTimer();
   reconnectAttempt = 0;
@@ -884,6 +906,7 @@ client.on('error', (err) => {
 
 client.on('disconnected', (eresult, msg) => {
   isLoggedOn = false;
+  hasFriendStatusReady = false;
   isLoggingOn = false;
   clearLoginTimeoutTimer();
   console.warn(`Steam 连接断开: ${eresult} - ${msg || '无附加信息'}`);
