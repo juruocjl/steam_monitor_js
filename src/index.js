@@ -21,6 +21,7 @@ const STEAM_RECONNECT_MAX_MS = Number(process.env.STEAM_RECONNECT_MAX_MS || 6000
 const STEAM_LOGIN_TIMEOUT_MS = Number(process.env.STEAM_LOGIN_TIMEOUT_MS || 30000);
 const STEAM_GUARD_CODE = process.env.STEAM_GUARD_CODE || '';
 const STEAM_AUTO_RELOGIN = String(process.env.STEAM_AUTO_RELOGIN || 'false').toLowerCase() === 'true';
+const STEAM_CRASH_ON_ERROR = String(process.env.STEAM_CRASH_ON_ERROR || 'true').toLowerCase() === 'true';
 
 const app = express();
 const client = new SteamUser({
@@ -869,6 +870,15 @@ client.on('error', (err) => {
   isLoggingOn = false;
   clearLoginTimeoutTimer();
   console.error('Steam 客户端错误:', err.message);
+
+  if (STEAM_CRASH_ON_ERROR) {
+    console.error('检测到 Steam 错误，进程将退出并交由上层自动重启。');
+    setTimeout(() => {
+      process.exit(1);
+    }, 200);
+    return;
+  }
+
   scheduleReconnect(`error:${err.message}`);
 });
 
