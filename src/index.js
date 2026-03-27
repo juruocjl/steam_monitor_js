@@ -282,11 +282,18 @@ async function initDatabase() {
   await dbRun('CREATE INDEX IF NOT EXISTS idx_history_user_id ON friend_game_history(user_id)');
   await dbRun('CREATE INDEX IF NOT EXISTS idx_game_name_updated_at ON game_name_map(updated_at)');
 
+  // 兼容旧版本数据：将未游玩时的 game_id=0 统一迁移为空字符串
+  await dbRun("UPDATE friend_game_history SET game_id = '' WHERE game_id = '0' OR game_id = 0");
+  await dbRun("DELETE FROM game_name_map WHERE game_id = '0' OR game_id = 0");
+
   const existingGameMappings = await dbAll(
     'SELECT game_id AS gameId, game_name AS gameName, icon_url AS iconUrl FROM game_name_map'
   );
   for (const row of existingGameMappings) {
     const gameId = normalizeGameIdKey(row.gameId);
+    if (!gameId) {
+      continue;
+    }
     gameNameById.set(gameId, row.gameName);
     if (row.iconUrl) {
       gameIconById.set(gameId, row.iconUrl);
@@ -646,7 +653,12 @@ async function readHistory(limit = 200) {
     [Math.max(1, limit)]
   );
 
-  return rows.reverse();
+  return rows
+    .reverse()
+    .map((row) => ({
+      ...row,
+      gameId: normalizeGameIdKey(row.gameId),
+    }));
 }
 
 function buildLogOnOptions() {
