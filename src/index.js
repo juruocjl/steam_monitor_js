@@ -20,10 +20,11 @@ const STEAM_RECONNECT_BASE_MS = Number(process.env.STEAM_RECONNECT_BASE_MS || 20
 const STEAM_RECONNECT_MAX_MS = Number(process.env.STEAM_RECONNECT_MAX_MS || 60000);
 const STEAM_LOGIN_TIMEOUT_MS = Number(process.env.STEAM_LOGIN_TIMEOUT_MS || 30000);
 const STEAM_GUARD_CODE = process.env.STEAM_GUARD_CODE || '';
+const STEAM_AUTO_RELOGIN = String(process.env.STEAM_AUTO_RELOGIN || 'false').toLowerCase() === 'true';
 
 const app = express();
 const client = new SteamUser({
-  autoRelogin: true,
+  autoRelogin: STEAM_AUTO_RELOGIN,
   renewRefreshTokens: true,
   enablePicsCache: true,
   language: STEAM_LANGUAGE,
@@ -94,9 +95,15 @@ function armLoginTimeout() {
       return;
     }
 
+    console.warn(`Steam 登录超时（>${STEAM_LOGIN_TIMEOUT_MS}ms），准备重置会话后重试。`);
+    try {
+      client.logOff();
+    } catch {
+      // ignore
+    }
+
     isLoggingOn = false;
-    console.warn(`Steam 登录超时（>${STEAM_LOGIN_TIMEOUT_MS}ms），准备重试。`);
-    scheduleReconnect('login-timeout');
+    scheduleReconnect('login-timeout-reset');
   }, Math.max(5000, STEAM_LOGIN_TIMEOUT_MS));
 }
 
@@ -106,7 +113,7 @@ function doLogOn(reason) {
     return;
   }
 
-  if (isLoggedOn || isLoggingOn) {
+  if (isLoggedOn || isLoggingOn || client._connecting === true) {
     return;
   }
 
@@ -116,6 +123,13 @@ function doLogOn(reason) {
     console.log(`正在尝试 Steam 登录: ${reason}`);
     client.logOn(cachedLogOnOptions);
   } catch (err) {
+    if (err && /Already attempting to log on/i.test(err.message || '')) {
+      console.warn('Steam 客户端仍处于登录中，跳过本次重连触发。');
+      isLoggingOn = true;
+      armLoginTimeout();
+      return;
+    }
+
     clearLoginTimeoutTimer();
     isLoggingOn = false;
     console.error('触发登录失败:', err.message);
@@ -134,7 +148,13 @@ function scheduleReconnect(reason) {
 
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
-    doLogOn(`重连第${reconnectAttempt}次`);
+    try {
+      doLogOn(`重连第${reconnectAttempt}次`);
+    } catch (err) {
+      console.error('执行重连失败:', err.message);
+      isLoggingOn = false;
+      scheduleReconnect('reconnect-exception');
+    }
   }, delay);
 }
 
