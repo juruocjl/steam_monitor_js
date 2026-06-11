@@ -22,6 +22,7 @@ const STEAM_LOGIN_TIMEOUT_MS = Number(process.env.STEAM_LOGIN_TIMEOUT_MS || 3000
 const STEAM_GUARD_CODE = process.env.STEAM_GUARD_CODE || '';
 const STEAM_AUTO_RELOGIN = String(process.env.STEAM_AUTO_RELOGIN || 'false').toLowerCase() === 'true';
 const STEAM_CRASH_ON_ERROR = String(process.env.STEAM_CRASH_ON_ERROR || 'true').toLowerCase() === 'true';
+const HEARTBEAT_INTERVAL_MS = Number(process.env.HEARTBEAT_INTERVAL_MS || 60000);
 
 const app = express();
 const client = new SteamUser({
@@ -46,6 +47,7 @@ let loginTimeoutTimer = null;
 let reconnectAttempt = 0;
 let db = null;
 let cachedLogOnOptions = null;
+let heartbeatTimer = null;
 
 const PERSONA_STATE_MAP = {
   0: '离线',
@@ -771,7 +773,25 @@ function hydrateFriendStatuses() {
     });
 
     hasFriendStatusReady = true;
+    console.log(`Friend status cache ready: friends=${friendStatuses.size}, playing=${getPlayingFriendCount()}`);
   });
+}
+
+function getPlayingFriendCount() {
+  return Array.from(friendStatuses.values()).filter((status) => normalizeGameIdKey(status.gameId)).length;
+}
+
+function startHeartbeat() {
+  if (heartbeatTimer || HEARTBEAT_INTERVAL_MS <= 0) {
+    return;
+  }
+
+  heartbeatTimer = setInterval(() => {
+    console.log(
+      `[heartbeat] loggedOn=${isLoggedOn} friendStatusReady=${hasFriendStatusReady} friends=${friendStatuses.size} playing=${getPlayingFriendCount()} botSteamId=${botSteamId || ''}`
+    );
+  }, HEARTBEAT_INTERVAL_MS);
+  heartbeatTimer.unref?.();
 }
 
 app.get('/api/health', (req, res) => {
@@ -977,6 +997,7 @@ async function start() {
   app.listen(PORT, () => {
     console.log(`API 服务已启动: http://localhost:${PORT}`);
   });
+  startHeartbeat();
 }
 
 start().catch((err) => {
