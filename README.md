@@ -65,6 +65,21 @@ npm start
 
 - `http://localhost:3000`
 
+### Docker 部署
+
+服务端推荐使用 Docker Compose 运行，让 Docker 负责自动重启：
+
+```bash
+mkdir -p data
+docker compose up -d --build
+```
+
+Compose 默认监听宿主机本地端口：
+
+- `http://127.0.0.1:5555`
+
+容器会挂载宿主机的 `.env` 和 `data/`。程序登录成功后更新的 `STEAM_REFRESH_TOKEN` 会继续写回宿主机 `.env`，SQLite 历史也会保存在宿主机 `data/friend_game_history.db`。
+
 ## 4. API 说明
 
 ### 健康检查
