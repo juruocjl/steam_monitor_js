@@ -1,14 +1,10 @@
-FROM node:22-bookworm-slim
+FROM node:22-bookworm
 
 WORKDIR /app
 
 ENV NODE_ENV=production
 ENV PORT=5555
 ENV SQLITE_DB_PATH=/app/data/friend_game_history.db
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates python3 make g++ \
-    && rm -rf /var/lib/apt/lists/*
 
 COPY package*.json ./
 RUN npm ci --omit=dev && npm cache clean --force
