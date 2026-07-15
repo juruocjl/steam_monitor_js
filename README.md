@@ -46,7 +46,7 @@ Copy-Item .env.example .env
 - `STEAM_LOGIN_TIMEOUT_MS`：登录超时自动重试阈值（默认 30000）
 - `STEAM_GUARD_CODE`：可选，一次性 Steam Guard 验证码（更推荐使用 `STEAM_REFRESH_TOKEN`）
 - `STEAM_AUTO_RELOGIN`：是否启用 `steam-user` 内建自动重连（默认 `false`，建议使用本项目自定义重连）
-- `STEAM_CRASH_ON_ERROR`：Steam 客户端出错时是否直接退出进程（默认 `true`，适合由上层自动拉起）
+- `STEAM_CRASH_ON_ERROR`：Steam 客户端出错时是否直接退出进程（默认 `false`，使用进程内指数退避重连，避免瞬时网络故障造成登录风暴）
 
 如果网络环境导致 Steam 商店接口超时，可配置：
 

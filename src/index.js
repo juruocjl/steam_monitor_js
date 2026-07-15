@@ -21,7 +21,7 @@ const STEAM_RECONNECT_MAX_MS = Number(process.env.STEAM_RECONNECT_MAX_MS || 6000
 const STEAM_LOGIN_TIMEOUT_MS = Number(process.env.STEAM_LOGIN_TIMEOUT_MS || 30000);
 const STEAM_GUARD_CODE = process.env.STEAM_GUARD_CODE || '';
 const STEAM_AUTO_RELOGIN = String(process.env.STEAM_AUTO_RELOGIN || 'false').toLowerCase() === 'true';
-const STEAM_CRASH_ON_ERROR = String(process.env.STEAM_CRASH_ON_ERROR || 'true').toLowerCase() === 'true';
+const STEAM_CRASH_ON_ERROR = String(process.env.STEAM_CRASH_ON_ERROR || 'false').toLowerCase() === 'true';
 const HEARTBEAT_INTERVAL_MS = Number(process.env.HEARTBEAT_INTERVAL_MS || 60000);
 
 const app = express();
@@ -117,7 +117,13 @@ function doLogOn(reason) {
     return;
   }
 
-  if (isLoggedOn || isLoggingOn || client._connecting === true) {
+  if (isLoggedOn || isLoggingOn) {
+    return;
+  }
+
+  if (client._connecting === true) {
+    console.warn('Steam 客户端底层连接仍未释放，延后重连。');
+    scheduleReconnect('client-still-connecting');
     return;
   }
 
@@ -931,8 +937,11 @@ client.on('refreshToken', (token) => {
 });
 
 client.on('error', (err) => {
+  isLoggedOn = false;
+  hasFriendStatusReady = false;
   isLoggingOn = false;
   clearLoginTimeoutTimer();
+  friendStatuses.clear();
   console.error('Steam 客户端错误:', err.message);
 
   if (STEAM_CRASH_ON_ERROR) {
