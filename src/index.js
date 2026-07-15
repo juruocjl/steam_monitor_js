@@ -771,10 +771,8 @@ function syncFriendStatusesFromCache(friendIds) {
   }
 
   friendIds.forEach((friendId) => {
-    const user = client.users?.[friendId];
-    if (user) {
-      upsertFriendStatus(friendId, user);
-    }
+    const user = client.users?.[friendId] || {};
+    upsertFriendStatus(friendId, user);
   });
 }
 
