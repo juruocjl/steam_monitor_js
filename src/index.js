@@ -750,31 +750,39 @@ function buildLogOnOptions() {
   return logOnOptions;
 }
 
-function hydrateFriendStatuses() {
-  if (!client.myFriends) {
-    return;
-  }
-
-  const friendIds = Object.entries(client.myFriends)
+function getCurrentFriendIds() {
+  return Object.entries(client.myFriends || {})
     .filter(([, relationship]) => relationship === SteamUser.EFriendRelationship.Friend)
     .map(([steamId]) => steamId);
+}
 
-  if (friendIds.length === 0) {
-    hasFriendStatusReady = true;
+function syncFriendStatusesFromCache(friendIds) {
+  const currentFriendIds = new Set(friendIds);
+  for (const steamId of friendStatuses.keys()) {
+    if (!currentFriendIds.has(steamId)) {
+      friendStatuses.delete(steamId);
+    }
+  }
+
+  friendIds.forEach((friendId) => {
+    const user = client.users?.[friendId];
+    if (user) {
+      upsertFriendStatus(friendId, user);
+    }
+  });
+}
+
+function markFriendStatusReady(source) {
+  if (!isLoggedOn) {
     return;
   }
 
-  client.getPersonas(friendIds, () => {
-    friendIds.forEach((friendId) => {
-      const user = client.users?.[friendId];
-      if (user) {
-        upsertFriendStatus(friendId, user);
-      }
-    });
-
-    hasFriendStatusReady = true;
-    console.log(`Friend status cache ready: friends=${friendStatuses.size}, playing=${getPlayingFriendCount()}`);
-  });
+  const friendIds = getCurrentFriendIds();
+  syncFriendStatusesFromCache(friendIds);
+  hasFriendStatusReady = true;
+  console.log(
+    `Friend status cache ready: source=${source}, relationships=${friendIds.length}, statuses=${friendStatuses.size}, playing=${getPlayingFriendCount()}`
+  );
 }
 
 function getPlayingFriendCount() {
@@ -800,6 +808,7 @@ app.get('/api/health', (req, res) => {
     loggedOn: isLoggedOn,
     friendStatusReady: hasFriendStatusReady,
     botSteamId,
+    friendRelationshipCount: getCurrentFriendIds().length,
     friendCount: friendStatuses.size,
   });
 });
@@ -900,8 +909,21 @@ client.on('loggedOn', () => {
   botSteamId = toSteamId64(client.steamID);
   console.log('Steam 登录成功，机器人 SteamID:', botSteamId);
 
+  friendStatuses.clear();
   client.setPersona(SteamUser.EPersonaState.Online);
-  hydrateFriendStatuses();
+});
+
+client.on('friendsList', () => {
+  const friendIds = getCurrentFriendIds();
+  hasFriendStatusReady = false;
+  console.log(`Steam 好友列表已就绪: relationships=${friendIds.length}`);
+  if (friendIds.length === 0) {
+    markFriendStatusReady('friendsList-empty');
+  }
+});
+
+client.on('friendPersonasLoaded', () => {
+  markFriendStatusReady('friendPersonasLoaded');
 });
 
 client.on('refreshToken', (token) => {
@@ -975,7 +997,10 @@ client.on('friendRelationship', (steamID, relationship) => {
         }
       });
     }
+    return;
   }
+
+  friendStatuses.delete(steamId);
 });
 
 client.on('user', (steamID, user) => {

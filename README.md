@@ -92,10 +92,14 @@ Compose 默认监听宿主机本地端口：
 {
   "ok": true,
   "loggedOn": true,
+  "friendStatusReady": true,
   "botSteamId": "7656119xxxxxxxxxx",
+  "friendRelationshipCount": 12,
   "friendCount": 12
 }
 ```
+
+`friendRelationshipCount` 是 Steam 返回的完整好友关系数量，`friendCount` 是已缓存状态数量；服务仅在好友列表和人物状态加载完成后将 `friendStatusReady` 设为 `true`。
 
 ### 好友状态列表
 
