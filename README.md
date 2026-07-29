@@ -93,13 +93,19 @@ Compose 默认监听宿主机本地端口：
   "ok": true,
   "loggedOn": true,
   "friendStatusReady": true,
+  "reconnectStopped": false,
+  "consecutiveLoginFailures": 0,
+  "maxConsecutiveLoginFailures": 3,
+  "lastLoginError": null,
   "botSteamId": "7656119xxxxxxxxxx",
   "friendRelationshipCount": 12,
   "friendCount": 12
 }
 ```
 
-`friendRelationshipCount` 是 Steam 返回的完整好友关系数量，`friendCount` 是已缓存状态数量；服务仅在好友列表和人物状态加载完成后将 `friendStatusReady` 设为 `true`。
+仅当 Steam 已登录且好友状态完成首次加载时，健康检查返回 HTTP 200；未就绪或重连已熔断时返回 HTTP 503。`friendRelationshipCount` 是 Steam 返回的完整好友关系数量，`friendCount` 是已缓存状态数量。
+
+普通登录错误连续失败次数达到 `STEAM_MAX_CONSECUTIVE_FAILURES`（默认 3）后会停止自动重连；`AccessDenied` 和 `RateLimitExceeded` 会立即停止。熔断后需要更新凭证或排除限流，再人工重启服务，避免无限请求 Steam。
 
 ### 好友状态列表
 

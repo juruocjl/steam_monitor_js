@@ -19,6 +19,10 @@ const STORE_PROXY = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || null;
 const STEAM_RECONNECT_BASE_MS = Number(process.env.STEAM_RECONNECT_BASE_MS || 2000);
 const STEAM_RECONNECT_MAX_MS = Number(process.env.STEAM_RECONNECT_MAX_MS || 60000);
 const STEAM_LOGIN_TIMEOUT_MS = Number(process.env.STEAM_LOGIN_TIMEOUT_MS || 30000);
+const STEAM_MAX_CONSECUTIVE_FAILURES = Math.max(
+  1,
+  Number.parseInt(process.env.STEAM_MAX_CONSECUTIVE_FAILURES || '3', 10) || 3
+);
 const STEAM_GUARD_CODE = process.env.STEAM_GUARD_CODE || '';
 const STEAM_AUTO_RELOGIN = String(process.env.STEAM_AUTO_RELOGIN || 'false').toLowerCase() === 'true';
 const STEAM_CRASH_ON_ERROR = String(process.env.STEAM_CRASH_ON_ERROR || 'false').toLowerCase() === 'true';
@@ -45,6 +49,11 @@ let isLoggingOn = false;
 let reconnectTimer = null;
 let loginTimeoutTimer = null;
 let reconnectAttempt = 0;
+let loginAttemptId = 0;
+let lastCountedFailureAttemptId = null;
+let consecutiveLoginFailures = 0;
+let reconnectStopped = false;
+let lastLoginError = null;
 let db = null;
 let cachedLogOnOptions = null;
 let heartbeatTimer = null;
@@ -91,6 +100,54 @@ function clearLoginTimeoutTimer() {
   loginTimeoutTimer = null;
 }
 
+function isNonRetryableLoginError(err, reason = '') {
+  const message = `${err?.message || ''} ${reason}`;
+  const eresult = Number(err?.eresult);
+  return eresult === 15 || eresult === 84 || /AccessDenied|RateLimitExceeded/i.test(message);
+}
+
+function stopAutomaticReconnect(reason) {
+  reconnectStopped = true;
+  lastLoginError = reason;
+  isLoggingOn = false;
+  clearReconnectTimer();
+  clearLoginTimeoutTimer();
+  console.error(
+    `Steam 自动重连已停止: ${reason}。请更新登录凭证或排查 Steam 限流后，人工重启服务。`
+  );
+}
+
+function recordLoginFailure(reason, err = null) {
+  if (reconnectStopped) {
+    return true;
+  }
+
+  lastLoginError = reason;
+  const alreadyCounted = loginAttemptId > 0 && lastCountedFailureAttemptId === loginAttemptId;
+
+  if (!alreadyCounted) {
+    consecutiveLoginFailures += 1;
+    lastCountedFailureAttemptId = loginAttemptId;
+  }
+
+  if (isNonRetryableLoginError(err, reason)) {
+    stopAutomaticReconnect(`不可重试的登录错误: ${reason}`);
+    return true;
+  }
+
+  if (consecutiveLoginFailures >= STEAM_MAX_CONSECUTIVE_FAILURES) {
+    stopAutomaticReconnect(
+      `已连续失败 ${consecutiveLoginFailures} 次（上限 ${STEAM_MAX_CONSECUTIVE_FAILURES}）: ${reason}`
+    );
+    return true;
+  }
+
+  console.warn(
+    `Steam 登录连续失败 ${consecutiveLoginFailures}/${STEAM_MAX_CONSECUTIVE_FAILURES}: ${reason}`
+  );
+  return false;
+}
+
 function armLoginTimeout() {
   clearLoginTimeoutTimer();
 
@@ -107,11 +164,18 @@ function armLoginTimeout() {
     }
 
     isLoggingOn = false;
-    scheduleReconnect('login-timeout-reset');
+    if (!recordLoginFailure('login-timeout-reset')) {
+      scheduleReconnect('login-timeout-reset');
+    }
   }, Math.max(5000, STEAM_LOGIN_TIMEOUT_MS));
 }
 
 function doLogOn(reason) {
+  if (reconnectStopped) {
+    console.warn(`Steam 自动重连已熔断，忽略登录请求: ${reason}`);
+    return;
+  }
+
   if (!cachedLogOnOptions) {
     console.warn('未找到登录参数，无法执行自动重连。');
     return;
@@ -128,6 +192,7 @@ function doLogOn(reason) {
   }
 
   isLoggingOn = true;
+  loginAttemptId += 1;
   armLoginTimeout();
   try {
     console.log(`正在尝试 Steam 登录: ${reason}`);
@@ -143,12 +208,14 @@ function doLogOn(reason) {
     clearLoginTimeoutTimer();
     isLoggingOn = false;
     console.error('触发登录失败:', err.message);
-    scheduleReconnect('logOn异常');
+    if (!recordLoginFailure(`logOn异常:${err.message}`, err)) {
+      scheduleReconnect('logOn异常');
+    }
   }
 }
 
 function scheduleReconnect(reason) {
-  if (isLoggedOn || isLoggingOn || reconnectTimer) {
+  if (reconnectStopped || isLoggedOn || isLoggingOn || reconnectTimer) {
     return;
   }
 
@@ -163,7 +230,9 @@ function scheduleReconnect(reason) {
     } catch (err) {
       console.error('执行重连失败:', err.message);
       isLoggingOn = false;
-      scheduleReconnect('reconnect-exception');
+      if (!recordLoginFailure(`reconnect-exception:${err.message}`, err)) {
+        scheduleReconnect('reconnect-exception');
+      }
     }
   }, delay);
 }
@@ -807,10 +876,15 @@ function startHeartbeat() {
 }
 
 app.get('/api/health', (req, res) => {
-  res.json({
-    ok: true,
+  const ok = isLoggedOn && hasFriendStatusReady && !reconnectStopped;
+  res.status(ok ? 200 : 503).json({
+    ok,
     loggedOn: isLoggedOn,
     friendStatusReady: hasFriendStatusReady,
+    reconnectStopped,
+    consecutiveLoginFailures,
+    maxConsecutiveLoginFailures: STEAM_MAX_CONSECUTIVE_FAILURES,
+    lastLoginError,
     botSteamId,
     friendRelationshipCount: getCurrentFriendIds().length,
     friendCount: friendStatuses.size,
@@ -907,6 +981,10 @@ client.on('loggedOn', () => {
   isLoggedOn = true;
   hasFriendStatusReady = false;
   isLoggingOn = false;
+  reconnectStopped = false;
+  consecutiveLoginFailures = 0;
+  lastCountedFailureAttemptId = null;
+  lastLoginError = null;
   clearLoginTimeoutTimer();
   reconnectAttempt = 0;
   clearReconnectTimer();
@@ -950,7 +1028,9 @@ client.on('error', (err) => {
     return;
   }
 
-  scheduleReconnect(`error:${err.message}`);
+  if (!recordLoginFailure(`error:${err.message}`, err)) {
+    scheduleReconnect(`error:${err.message}`);
+  }
 });
 
 client.on('disconnected', (eresult, msg) => {
@@ -959,7 +1039,10 @@ client.on('disconnected', (eresult, msg) => {
   isLoggingOn = false;
   clearLoginTimeoutTimer();
   console.warn(`Steam 连接断开: ${eresult} - ${msg || '无附加信息'}`);
-  scheduleReconnect(`disconnected:${eresult}`);
+  const reason = `disconnected:${eresult}${msg ? `:${msg}` : ''}`;
+  if (!recordLoginFailure(reason, { eresult, message: msg })) {
+    scheduleReconnect(`disconnected:${eresult}`);
+  }
 });
 
 client.on('steamGuard', (domain, callback) => {
@@ -975,7 +1058,7 @@ client.on('steamGuard', (domain, callback) => {
   );
   isLoggingOn = false;
   clearLoginTimeoutTimer();
-  scheduleReconnect('steam-guard-required');
+  stopAutomaticReconnect(`需要 Steam Guard 验证（${hint}）`);
   callback('');
 });
 
