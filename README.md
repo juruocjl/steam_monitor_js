@@ -78,7 +78,7 @@ Compose 默认监听宿主机本地端口：
 
 - `http://127.0.0.1:5555`
 
-容器会挂载宿主机的 `.env` 和 `data/`。程序登录成功后更新的 `STEAM_REFRESH_TOKEN` 会继续写回宿主机 `.env`，SQLite 历史也会保存在宿主机 `data/friend_game_history.db`。
+容器会挂载宿主机的 `.env` 和 `data/`。程序登录成功后更新的 `STEAM_REFRESH_TOKEN` 会立即用于后续重连并写回宿主机 `.env`；容器进程重启时也会直接读取该文件中的最新 token。SQLite 历史会保存在宿主机 `data/friend_game_history.db`。
 
 ## 4. API 说明
 

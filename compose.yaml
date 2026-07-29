@@ -6,8 +6,6 @@ services:
     container_name: steam_monitor
     restart: unless-stopped
     init: true
-    env_file:
-      - .env
     environment:
       PORT: "5555"
       SQLITE_DB_PATH: /app/data/friend_game_history.db

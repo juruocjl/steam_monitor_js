@@ -454,6 +454,11 @@ function persistRefreshToken(token) {
 
   fs.writeFileSync(ENV_FILE, nextContent, 'utf8');
   process.env.STEAM_REFRESH_TOKEN = token;
+  if (cachedLogOnOptions) {
+    cachedLogOnOptions.refreshToken = token;
+    delete cachedLogOnOptions.accountName;
+    delete cachedLogOnOptions.password;
+  }
   console.log('已自动保存最新 STEAM_REFRESH_TOKEN 到 .env');
 }
 
