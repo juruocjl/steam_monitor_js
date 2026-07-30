@@ -8,6 +8,7 @@ const sqlite3 = require('sqlite3').verbose();
 require('dotenv').config();
 
 const PORT = Number(process.env.PORT || 3000);
+const API_BIND_HOST = process.env.API_BIND_HOST || '0.0.0.0';
 const DATA_DIR = path.join(process.cwd(), 'data');
 const DB_FILE = process.env.SQLITE_DB_PATH || path.join(DATA_DIR, 'friend_game_history.db');
 const ENV_FILE = path.join(process.cwd(), '.env');
@@ -26,6 +27,9 @@ const STEAM_MAX_CONSECUTIVE_FAILURES = Math.max(
 const STEAM_GUARD_CODE = process.env.STEAM_GUARD_CODE || '';
 const STEAM_AUTO_RELOGIN = String(process.env.STEAM_AUTO_RELOGIN || 'false').toLowerCase() === 'true';
 const STEAM_CRASH_ON_ERROR = String(process.env.STEAM_CRASH_ON_ERROR || 'false').toLowerCase() === 'true';
+const STEAM_SOCKS_PROXY = process.env.STEAM_SOCKS_PROXY || null;
+const STEAM_WEB_COMPATIBILITY_MODE =
+  String(process.env.STEAM_WEB_COMPATIBILITY_MODE || (STEAM_SOCKS_PROXY ? 'true' : 'false')).toLowerCase() === 'true';
 const HEARTBEAT_INTERVAL_MS = Number(process.env.HEARTBEAT_INTERVAL_MS || 60000);
 
 const app = express();
@@ -34,6 +38,8 @@ const client = new SteamUser({
   renewRefreshTokens: true,
   enablePicsCache: true,
   language: STEAM_LANGUAGE,
+  socksProxy: STEAM_SOCKS_PROXY,
+  webCompatibilityMode: STEAM_WEB_COMPATIBILITY_MODE,
 });
 
 const friendStatuses = new Map();
@@ -890,6 +896,8 @@ app.get('/api/health', (req, res) => {
     consecutiveLoginFailures,
     maxConsecutiveLoginFailures: STEAM_MAX_CONSECUTIVE_FAILURES,
     lastLoginError,
+    steamProxyEnabled: Boolean(STEAM_SOCKS_PROXY),
+    steamWebCompatibilityMode: STEAM_WEB_COMPATIBILITY_MODE,
     botSteamId,
     friendRelationshipCount: getCurrentFriendIds().length,
     friendCount: friendStatuses.size,
@@ -1111,11 +1119,14 @@ async function start() {
   ensureStorage();
   await initDatabase();
 
+  console.log(
+    `Steam 连接配置: socksProxy=${STEAM_SOCKS_PROXY ? 'enabled' : 'disabled'} webCompatibilityMode=${STEAM_WEB_COMPATIBILITY_MODE}`
+  );
   cachedLogOnOptions = buildLogOnOptions();
   doLogOn('初次启动');
 
-  app.listen(PORT, () => {
-    console.log(`API 服务已启动: http://localhost:${PORT}`);
+  app.listen(PORT, API_BIND_HOST, () => {
+    console.log(`API 服务已启动: http://${API_BIND_HOST}:${PORT}`);
   });
   startHeartbeat();
 }

@@ -44,6 +44,8 @@ Copy-Item .env.example .env
 登录稳定性配置：
 
 - `STEAM_LOGIN_TIMEOUT_MS`：登录超时自动重试阈值（默认 30000）
+- `STEAM_SOCKS_PROXY`：Steam 登录连接使用的 SOCKS4/5 代理
+- `STEAM_WEB_COMPATIBILITY_MODE`：强制使用 WebSocket 443；配置 SOCKS 代理时默认启用
 - `STEAM_GUARD_CODE`：可选，一次性 Steam Guard 验证码（更推荐使用 `STEAM_REFRESH_TOKEN`）
 - `STEAM_AUTO_RELOGIN`：是否启用 `steam-user` 内建自动重连（默认 `false`，建议使用本项目自定义重连）
 - `STEAM_CRASH_ON_ERROR`：Steam 客户端出错时是否直接退出进程（默认 `false`，使用进程内指数退避重连，避免瞬时网络故障造成登录风暴）
@@ -74,9 +76,11 @@ mkdir -p data
 docker compose up -d --build
 ```
 
-Compose 默认监听宿主机本地端口：
+Compose 使用 host 网络访问宿主机上仅监听回环地址的 Clash SOCKS 端口，并将 API 仅监听在宿主机本地：
 
 - `http://127.0.0.1:5555`
+
+默认代理地址为 `socks5://127.0.0.1:7891`。如果服务器没有本机 Clash/Mihomo，删除 `compose.yaml` 中的 `STEAM_SOCKS_PROXY`、`STEAM_WEB_COMPATIBILITY_MODE` 和 `network_mode`，恢复端口映射部署。
 
 容器会挂载宿主机的 `.env` 和 `data/`。程序登录成功后更新的 `STEAM_REFRESH_TOKEN` 会立即用于后续重连并写回宿主机 `.env`；容器进程重启时也会直接读取该文件中的最新 token。SQLite 历史会保存在宿主机 `data/friend_game_history.db`。
 
@@ -97,6 +101,8 @@ Compose 默认监听宿主机本地端口：
   "consecutiveLoginFailures": 0,
   "maxConsecutiveLoginFailures": 3,
   "lastLoginError": null,
+  "steamProxyEnabled": true,
+  "steamWebCompatibilityMode": true,
   "botSteamId": "7656119xxxxxxxxxx",
   "friendRelationshipCount": 12,
   "friendCount": 12

@@ -6,11 +6,13 @@ services:
     container_name: steam_monitor
     restart: unless-stopped
     init: true
+    network_mode: host
     environment:
       PORT: "5555"
+      API_BIND_HOST: "127.0.0.1"
       SQLITE_DB_PATH: /app/data/friend_game_history.db
-    ports:
-      - "127.0.0.1:5555:5555"
+      STEAM_SOCKS_PROXY: "socks5://127.0.0.1:7891"
+      STEAM_WEB_COMPATIBILITY_MODE: "true"
     volumes:
       - ./.env:/app/.env
       - ./data:/app/data
