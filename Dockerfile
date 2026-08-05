@@ -1,3 +1,14 @@
+FROM node:22-bookworm AS dependencies
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends python3 make g++ \
+  && rm -rf /var/lib/apt/lists/* \
+  && npm_config_build_from_source=true npm_config_nodedir=/usr/local npm ci --omit=dev \
+  && npm cache clean --force
+
 FROM node:22-bookworm
 
 WORKDIR /app
@@ -7,8 +18,7 @@ ENV PORT=5555
 ENV SQLITE_DB_PATH=/app/data/friend_game_history.db
 
 COPY package*.json ./
-RUN npm ci --omit=dev && npm cache clean --force
-
+COPY --from=dependencies /app/node_modules ./node_modules
 COPY src ./src
 
 RUN mkdir -p /app/data && chown -R node:node /app
