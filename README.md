@@ -46,6 +46,8 @@ Copy-Item .env.example .env
 - `STEAM_LOGIN_TIMEOUT_MS`：登录超时自动重试阈值（默认 30000）
 - `STEAM_SOCKS_PROXY`：Steam 登录连接使用的 SOCKS4/5 代理
 - `STEAM_WEB_COMPATIBILITY_MODE`：强制使用 WebSocket 443；配置 SOCKS 代理时默认启用
+- `CLASH_AUTO_FAILOVER_ENABLED`：连接失败时先探测并切换 Clash 节点，再进行一次受控重连
+- `CLASH_FAILOVER_GROUP` / `CLASH_FAILOVER_CANDIDATES`：要切换的选择器及按顺序尝试的候选组
 - `STEAM_GUARD_CODE`：可选，一次性 Steam Guard 验证码（更推荐使用 `STEAM_REFRESH_TOKEN`）
 - `STEAM_AUTO_RELOGIN`：是否启用 `steam-user` 内建自动重连（默认 `false`，建议使用本项目自定义重连）
 - `STEAM_CRASH_ON_ERROR`：Steam 客户端出错时是否直接退出进程（默认 `false`，使用进程内指数退避重连，避免瞬时网络故障造成登录风暴）
@@ -81,6 +83,8 @@ Compose 使用 host 网络访问宿主机上仅监听回环地址的 Clash SOCKS
 - `http://127.0.0.1:5555`
 
 默认代理地址为 `socks5://127.0.0.1:7891`。如果服务器没有本机 Clash/Mihomo，删除 `compose.yaml` 中的 `STEAM_SOCKS_PROXY`、`STEAM_WEB_COMPATIBILITY_MODE` 和 `network_mode`，恢复端口映射部署。
+
+连接类错误（如 `NoConnection`、`ServiceUnavailable`、连接超时）发生时，服务会通过 Mihomo 控制接口测试候选节点，切换成功后再尝试登录。认证拒绝、限流和 Steam Guard 不会触发切换。一次故障周期不会重复选择已经尝试过的节点，达到连续失败上限后仍会熔断。
 
 容器会挂载宿主机的 `.env` 和 `data/`。程序登录成功后更新的 `STEAM_REFRESH_TOKEN` 会立即用于后续重连并写回宿主机 `.env`；容器进程重启时也会直接读取该文件中的最新 token。SQLite 历史会保存在宿主机 `data/friend_game_history.db`。
 

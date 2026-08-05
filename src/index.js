@@ -5,6 +5,7 @@ const express = require('express');
 const SteamUser = require('steam-user');
 const { HttpsProxyAgent } = require('hpagent');
 const sqlite3 = require('sqlite3').verbose();
+const { ClashFailover } = require('./clash-failover');
 require('dotenv').config();
 
 const PORT = Number(process.env.PORT || 3000);
@@ -30,7 +31,22 @@ const STEAM_CRASH_ON_ERROR = String(process.env.STEAM_CRASH_ON_ERROR || 'false')
 const STEAM_SOCKS_PROXY = process.env.STEAM_SOCKS_PROXY || null;
 const STEAM_WEB_COMPATIBILITY_MODE =
   String(process.env.STEAM_WEB_COMPATIBILITY_MODE || (STEAM_SOCKS_PROXY ? 'true' : 'false')).toLowerCase() === 'true';
+const CLASH_AUTO_FAILOVER_ENABLED = String(process.env.CLASH_AUTO_FAILOVER_ENABLED || 'false').toLowerCase() === 'true';
+const CLASH_FAILOVER_CANDIDATES = String(process.env.CLASH_FAILOVER_CANDIDATES || 'Auto,Fallback')
+  .split(',')
+  .map((value) => value.trim())
+  .filter(Boolean);
 const HEARTBEAT_INTERVAL_MS = Number(process.env.HEARTBEAT_INTERVAL_MS || 60000);
+
+const clashFailover = new ClashFailover({
+  enabled: CLASH_AUTO_FAILOVER_ENABLED,
+  controllerUrl: process.env.CLASH_CONTROLLER_URL,
+  secretFile: process.env.CLASH_CONTROLLER_SECRET_FILE,
+  group: process.env.CLASH_FAILOVER_GROUP || 'E-IX',
+  candidates: CLASH_FAILOVER_CANDIDATES,
+  testUrl: process.env.CLASH_FAILOVER_TEST_URL,
+  timeoutMs: Number(process.env.CLASH_FAILOVER_TEST_TIMEOUT_MS || 8000),
+});
 
 const app = express();
 const client = new SteamUser({
@@ -57,6 +73,7 @@ let loginTimeoutTimer = null;
 let reconnectAttempt = 0;
 let loginAttemptId = 0;
 let lastCountedFailureAttemptId = null;
+let lastClashFailoverAttemptId = null;
 let consecutiveLoginFailures = 0;
 let reconnectStopped = false;
 let lastLoginError = null;
@@ -110,6 +127,33 @@ function isNonRetryableLoginError(err, reason = '') {
   const message = `${err?.message || ''} ${reason}`;
   const eresult = Number(err?.eresult);
   return eresult === 15 || eresult === 84 || /AccessDenied|RateLimitExceeded/i.test(message);
+}
+
+function isConnectionLoginError(err, reason = '') {
+  const message = `${err?.message || ''} ${reason}`;
+  return /NoConnection|ServiceUnavailable|Request timed out|login-timeout|timed?\s*out|ECONN|ENET|EHOST|socket|network|WebSocket/i.test(
+    message
+  );
+}
+
+async function scheduleReconnectAfterFailure(reason, err = null, forceConnectionFailure = false) {
+  if (reconnectStopped) {
+    return;
+  }
+
+  let reconnectReason = reason;
+  const isConnectionFailure = forceConnectionFailure || isConnectionLoginError(err, reason);
+  if (isConnectionFailure && lastClashFailoverAttemptId !== loginAttemptId) {
+    lastClashFailoverAttemptId = loginAttemptId;
+    const failover = await clashFailover.failover(reason);
+    if (reconnectStopped) {
+      return;
+    }
+    if (failover.switched) {
+      reconnectReason = `clash-failover:${failover.from || 'unknown'}->${failover.to}`;
+    }
+  }
+  scheduleReconnect(reconnectReason);
 }
 
 function stopAutomaticReconnect(reason) {
@@ -171,7 +215,7 @@ function armLoginTimeout() {
 
     isLoggingOn = false;
     if (!recordLoginFailure('login-timeout-reset')) {
-      scheduleReconnect('login-timeout-reset');
+      void scheduleReconnectAfterFailure('login-timeout-reset', null, true);
     }
   }, Math.max(5000, STEAM_LOGIN_TIMEOUT_MS));
 }
@@ -215,7 +259,7 @@ function doLogOn(reason) {
     isLoggingOn = false;
     console.error('触发登录失败:', err.message);
     if (!recordLoginFailure(`logOn异常:${err.message}`, err)) {
-      scheduleReconnect('logOn异常');
+      void scheduleReconnectAfterFailure('logOn异常', err);
     }
   }
 }
@@ -237,7 +281,7 @@ function scheduleReconnect(reason) {
       console.error('执行重连失败:', err.message);
       isLoggingOn = false;
       if (!recordLoginFailure(`reconnect-exception:${err.message}`, err)) {
-        scheduleReconnect('reconnect-exception');
+        void scheduleReconnectAfterFailure('reconnect-exception', err);
       }
     }
   }, delay);
@@ -898,6 +942,7 @@ app.get('/api/health', (req, res) => {
     lastLoginError,
     steamProxyEnabled: Boolean(STEAM_SOCKS_PROXY),
     steamWebCompatibilityMode: STEAM_WEB_COMPATIBILITY_MODE,
+    clashFailover: clashFailover.snapshot(),
     botSteamId,
     friendRelationshipCount: getCurrentFriendIds().length,
     friendCount: friendStatuses.size,
@@ -997,7 +1042,9 @@ client.on('loggedOn', () => {
   reconnectStopped = false;
   consecutiveLoginFailures = 0;
   lastCountedFailureAttemptId = null;
+  lastClashFailoverAttemptId = null;
   lastLoginError = null;
+  clashFailover.resetCycle();
   clearLoginTimeoutTimer();
   reconnectAttempt = 0;
   clearReconnectTimer();
@@ -1042,7 +1089,7 @@ client.on('error', (err) => {
   }
 
   if (!recordLoginFailure(`error:${err.message}`, err)) {
-    scheduleReconnect(`error:${err.message}`);
+    void scheduleReconnectAfterFailure(`error:${err.message}`, err);
   }
 });
 
@@ -1054,7 +1101,7 @@ client.on('disconnected', (eresult, msg) => {
   console.warn(`Steam 连接断开: ${eresult} - ${msg || '无附加信息'}`);
   const reason = `disconnected:${eresult}${msg ? `:${msg}` : ''}`;
   if (!recordLoginFailure(reason, { eresult, message: msg })) {
-    scheduleReconnect(`disconnected:${eresult}`);
+    void scheduleReconnectAfterFailure(`disconnected:${eresult}`, { eresult, message: msg }, true);
   }
 });
 
@@ -1121,6 +1168,9 @@ async function start() {
 
   console.log(
     `Steam 连接配置: socksProxy=${STEAM_SOCKS_PROXY ? 'enabled' : 'disabled'} webCompatibilityMode=${STEAM_WEB_COMPATIBILITY_MODE}`
+  );
+  console.log(
+    `Clash 自动故障转移: enabled=${CLASH_AUTO_FAILOVER_ENABLED} group=${clashFailover.group} candidates=${CLASH_FAILOVER_CANDIDATES.join(',')}`
   );
   cachedLogOnOptions = buildLogOnOptions();
   doLogOn('初次启动');
