@@ -6,6 +6,7 @@ const SteamUser = require('steam-user');
 const { HttpsProxyAgent } = require('hpagent');
 const sqlite3 = require('sqlite3').verbose();
 const { ClashFailover } = require('./clash-failover');
+const { calculateExponentialBackoff } = require('./recovery-backoff');
 require('dotenv').config();
 
 const PORT = Number(process.env.PORT || 3000);
@@ -20,6 +21,11 @@ const STEAM_STORE_RETRY_DELAY_MS = Number(process.env.STEAM_STORE_RETRY_DELAY_MS
 const STORE_PROXY = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || null;
 const STEAM_RECONNECT_BASE_MS = Number(process.env.STEAM_RECONNECT_BASE_MS || 2000);
 const STEAM_RECONNECT_MAX_MS = Number(process.env.STEAM_RECONNECT_MAX_MS || 60000);
+const STEAM_RECOVERY_BASE_MS = Math.max(1000, Number(process.env.STEAM_RECOVERY_BASE_MS || 60000));
+const STEAM_RECOVERY_MAX_MS = Math.max(
+  STEAM_RECOVERY_BASE_MS,
+  Number(process.env.STEAM_RECOVERY_MAX_MS || 1800000)
+);
 const STEAM_LOGIN_TIMEOUT_MS = Number(process.env.STEAM_LOGIN_TIMEOUT_MS || 30000);
 const STEAM_MAX_CONSECUTIVE_FAILURES = Math.max(
   1,
@@ -69,8 +75,13 @@ let isLoggedOn = false;
 let hasFriendStatusReady = false;
 let isLoggingOn = false;
 let reconnectTimer = null;
+let recoveryTimer = null;
 let loginTimeoutTimer = null;
 let reconnectAttempt = 0;
+let recoveryAttempt = 0;
+let recoveryMode = false;
+let nextRecoveryAt = null;
+let lastRecoveryProbe = null;
 let loginAttemptId = 0;
 let lastCountedFailureAttemptId = null;
 let lastClashFailoverAttemptId = null;
@@ -123,6 +134,16 @@ function clearLoginTimeoutTimer() {
   loginTimeoutTimer = null;
 }
 
+function clearRecoveryTimer() {
+  if (!recoveryTimer) {
+    return;
+  }
+
+  clearTimeout(recoveryTimer);
+  recoveryTimer = null;
+  nextRecoveryAt = null;
+}
+
 function isNonRetryableLoginError(err, reason = '') {
   const message = `${err?.message || ''} ${reason}`;
   const eresult = Number(err?.eresult);
@@ -137,7 +158,7 @@ function isConnectionLoginError(err, reason = '') {
 }
 
 async function scheduleReconnectAfterFailure(reason, err = null, forceConnectionFailure = false) {
-  if (reconnectStopped) {
+  if (reconnectStopped || recoveryMode) {
     return;
   }
 
@@ -158,18 +179,21 @@ async function scheduleReconnectAfterFailure(reason, err = null, forceConnection
 
 function stopAutomaticReconnect(reason) {
   reconnectStopped = true;
+  recoveryMode = false;
+  nextRecoveryAt = null;
   lastLoginError = reason;
   isLoggingOn = false;
   clearReconnectTimer();
+  clearRecoveryTimer();
   clearLoginTimeoutTimer();
   console.error(
     `Steam 自动重连已停止: ${reason}。请更新登录凭证或排查 Steam 限流后，人工重启服务。`
   );
 }
 
-function recordLoginFailure(reason, err = null) {
+function recordLoginFailure(reason, err = null, forceConnectionFailure = false) {
   if (reconnectStopped) {
-    return true;
+    return 'stopped';
   }
 
   lastLoginError = reason;
@@ -182,20 +206,107 @@ function recordLoginFailure(reason, err = null) {
 
   if (isNonRetryableLoginError(err, reason)) {
     stopAutomaticReconnect(`不可重试的登录错误: ${reason}`);
-    return true;
+    return 'stopped';
+  }
+
+  if (alreadyCounted) {
+    console.warn(`忽略同一次登录尝试的重复失败事件: ${reason}`);
+    return 'duplicate';
+  }
+
+  const isConnectionFailure = forceConnectionFailure || isConnectionLoginError(err, reason);
+  if (recoveryMode && isConnectionFailure) {
+    return 'recovery';
   }
 
   if (consecutiveLoginFailures >= STEAM_MAX_CONSECUTIVE_FAILURES) {
-    stopAutomaticReconnect(
-      `已连续失败 ${consecutiveLoginFailures} 次（上限 ${STEAM_MAX_CONSECUTIVE_FAILURES}）: ${reason}`
-    );
-    return true;
+    if (isConnectionFailure) {
+      console.warn(
+        `Steam 连接连续失败 ${consecutiveLoginFailures} 次，进入带通路探测的指数退避恢复模式: ${reason}`
+      );
+      return 'recovery';
+    }
+
+    stopAutomaticReconnect(`已连续失败 ${consecutiveLoginFailures} 次且不是连接错误: ${reason}`);
+    return 'stopped';
   }
 
   console.warn(
     `Steam 登录连续失败 ${consecutiveLoginFailures}/${STEAM_MAX_CONSECUTIVE_FAILURES}: ${reason}`
   );
-  return false;
+  return 'retry';
+}
+
+function handleLoginFailure(reason, err = null, forceConnectionFailure = false) {
+  const outcome = recordLoginFailure(reason, err, forceConnectionFailure);
+  if (outcome === 'retry') {
+    void scheduleReconnectAfterFailure(reason, err, forceConnectionFailure);
+  } else if (outcome === 'recovery') {
+    scheduleRecovery(reason);
+  }
+}
+
+async function runRecoveryProbe(reason, attempt) {
+  if (reconnectStopped || isLoggedOn) {
+    return;
+  }
+
+  const probe = await clashFailover.ensureAvailable(`recovery-${attempt}:${reason}`);
+  lastRecoveryProbe = {
+    ...probe,
+    at: probe.at || new Date().toISOString(),
+    attempt,
+  };
+
+  if (reconnectStopped || isLoggedOn) {
+    return;
+  }
+
+  if (!probe.available) {
+    console.warn(`第 ${attempt} 轮恢复探测失败，不请求 Steam 登录: ${probe.error || '通路不可用'}`);
+    scheduleRecovery(`probe-failed:${probe.error || reason}`);
+    return;
+  }
+
+  console.warn(
+    `第 ${attempt} 轮恢复探测通过${probe.switched ? `，已切换到 ${probe.to}` : ''}，执行一次 Steam 登录。`
+  );
+  lastClashFailoverAttemptId = null;
+  doLogOn(`自动恢复第${attempt}轮`);
+}
+
+function scheduleRecovery(reason) {
+  if (reconnectStopped || isLoggedOn || recoveryTimer) {
+    return;
+  }
+
+  recoveryMode = true;
+  isLoggingOn = false;
+  clearReconnectTimer();
+  clearLoginTimeoutTimer();
+  recoveryAttempt += 1;
+  const attempt = recoveryAttempt;
+  const delay = calculateExponentialBackoff(attempt, STEAM_RECOVERY_BASE_MS, STEAM_RECOVERY_MAX_MS);
+  nextRecoveryAt = new Date(Date.now() + delay).toISOString();
+  console.warn(
+    `已计划第 ${attempt} 轮自动恢复，${delay}ms 后先探测 Steam 通路，原因: ${reason}`
+  );
+
+  recoveryTimer = setTimeout(() => {
+    recoveryTimer = null;
+    nextRecoveryAt = null;
+    void runRecoveryProbe(reason, attempt).catch((err) => {
+      lastRecoveryProbe = {
+        available: false,
+        at: new Date().toISOString(),
+        attempt,
+        error: err.message,
+      };
+      console.error(`第 ${attempt} 轮恢复探测异常: ${err.message}`);
+      scheduleRecovery(`probe-exception:${err.message}`);
+    });
+  }, delay);
+  recoveryTimer.unref?.();
 }
 
 function armLoginTimeout() {
@@ -214,9 +325,7 @@ function armLoginTimeout() {
     }
 
     isLoggingOn = false;
-    if (!recordLoginFailure('login-timeout-reset')) {
-      void scheduleReconnectAfterFailure('login-timeout-reset', null, true);
-    }
+    handleLoginFailure('login-timeout-reset', null, true);
   }, Math.max(5000, STEAM_LOGIN_TIMEOUT_MS));
 }
 
@@ -237,7 +346,11 @@ function doLogOn(reason) {
 
   if (client._connecting === true) {
     console.warn('Steam 客户端底层连接仍未释放，延后重连。');
-    scheduleReconnect('client-still-connecting');
+    if (recoveryMode) {
+      scheduleRecovery('client-still-connecting');
+    } else {
+      scheduleReconnect('client-still-connecting');
+    }
     return;
   }
 
@@ -258,14 +371,12 @@ function doLogOn(reason) {
     clearLoginTimeoutTimer();
     isLoggingOn = false;
     console.error('触发登录失败:', err.message);
-    if (!recordLoginFailure(`logOn异常:${err.message}`, err)) {
-      void scheduleReconnectAfterFailure('logOn异常', err);
-    }
+    handleLoginFailure(`logOn异常:${err.message}`, err);
   }
 }
 
 function scheduleReconnect(reason) {
-  if (reconnectStopped || isLoggedOn || isLoggingOn || reconnectTimer) {
+  if (reconnectStopped || recoveryMode || isLoggedOn || isLoggingOn || reconnectTimer) {
     return;
   }
 
@@ -280,9 +391,7 @@ function scheduleReconnect(reason) {
     } catch (err) {
       console.error('执行重连失败:', err.message);
       isLoggingOn = false;
-      if (!recordLoginFailure(`reconnect-exception:${err.message}`, err)) {
-        void scheduleReconnectAfterFailure('reconnect-exception', err);
-      }
+      handleLoginFailure(`reconnect-exception:${err.message}`, err);
     }
   }, delay);
 }
@@ -924,7 +1033,7 @@ function startHeartbeat() {
 
   heartbeatTimer = setInterval(() => {
     console.log(
-      `[heartbeat] loggedOn=${isLoggedOn} friendStatusReady=${hasFriendStatusReady} friends=${friendStatuses.size} playing=${getPlayingFriendCount()} botSteamId=${botSteamId || ''}`
+      `[heartbeat] loggedOn=${isLoggedOn} friendStatusReady=${hasFriendStatusReady} recoveryMode=${recoveryMode} recoveryAttempt=${recoveryAttempt} nextRecoveryAt=${nextRecoveryAt || ''} friends=${friendStatuses.size} playing=${getPlayingFriendCount()} botSteamId=${botSteamId || ''}`
     );
   }, HEARTBEAT_INTERVAL_MS);
   heartbeatTimer.unref?.();
@@ -937,6 +1046,12 @@ app.get('/api/health', (req, res) => {
     loggedOn: isLoggedOn,
     friendStatusReady: hasFriendStatusReady,
     reconnectStopped,
+    recoveryMode,
+    recoveryAttempt,
+    nextRecoveryAt,
+    recoveryBaseMs: STEAM_RECOVERY_BASE_MS,
+    recoveryMaxMs: STEAM_RECOVERY_MAX_MS,
+    lastRecoveryProbe,
     consecutiveLoginFailures,
     maxConsecutiveLoginFailures: STEAM_MAX_CONSECUTIVE_FAILURES,
     lastLoginError,
@@ -1040,12 +1155,16 @@ client.on('loggedOn', () => {
   hasFriendStatusReady = false;
   isLoggingOn = false;
   reconnectStopped = false;
+  recoveryMode = false;
+  recoveryAttempt = 0;
+  nextRecoveryAt = null;
   consecutiveLoginFailures = 0;
   lastCountedFailureAttemptId = null;
   lastClashFailoverAttemptId = null;
   lastLoginError = null;
   clashFailover.resetCycle();
   clearLoginTimeoutTimer();
+  clearRecoveryTimer();
   reconnectAttempt = 0;
   clearReconnectTimer();
   botSteamId = toSteamId64(client.steamID);
@@ -1088,9 +1207,7 @@ client.on('error', (err) => {
     return;
   }
 
-  if (!recordLoginFailure(`error:${err.message}`, err)) {
-    void scheduleReconnectAfterFailure(`error:${err.message}`, err);
-  }
+  handleLoginFailure(`error:${err.message}`, err);
 });
 
 client.on('disconnected', (eresult, msg) => {
@@ -1100,9 +1217,7 @@ client.on('disconnected', (eresult, msg) => {
   clearLoginTimeoutTimer();
   console.warn(`Steam 连接断开: ${eresult} - ${msg || '无附加信息'}`);
   const reason = `disconnected:${eresult}${msg ? `:${msg}` : ''}`;
-  if (!recordLoginFailure(reason, { eresult, message: msg })) {
-    void scheduleReconnectAfterFailure(`disconnected:${eresult}`, { eresult, message: msg }, true);
-  }
+  handleLoginFailure(reason, { eresult, message: msg }, true);
 });
 
 client.on('steamGuard', (domain, callback) => {
@@ -1171,6 +1286,9 @@ async function start() {
   );
   console.log(
     `Clash 自动故障转移: enabled=${CLASH_AUTO_FAILOVER_ENABLED} group=${clashFailover.group} candidates=${CLASH_FAILOVER_CANDIDATES.join(',')}`
+  );
+  console.log(
+    `Steam 自动恢复: quickFailures=${STEAM_MAX_CONSECUTIVE_FAILURES} recoveryBaseMs=${STEAM_RECOVERY_BASE_MS} recoveryMaxMs=${STEAM_RECOVERY_MAX_MS}`
   );
   cachedLogOnOptions = buildLogOnOptions();
   doLogOn('初次启动');

@@ -52,6 +52,96 @@ class ClashFailover {
     return this.inFlight;
   }
 
+  async ensureAvailable(reason) {
+    if (!this.enabled) {
+      return { available: true, switched: false, reason: 'disabled' };
+    }
+
+    if (this.inFlight) {
+      return this.inFlight;
+    }
+
+    this.inFlight = this.#ensureAvailable(reason).finally(() => {
+      this.inFlight = null;
+    });
+    return this.inFlight;
+  }
+
+  async #ensureAvailable(reason) {
+    this.resetCycle();
+    try {
+      const group = await this.#request(`/proxies/${encodeURIComponent(this.group)}`);
+      const current = group?.now || null;
+      const allowed = new Set(group?.all || []);
+      this.currentSelection = current;
+
+      if (current) {
+        this.triedSelections.add(current);
+        try {
+          const delay = await this.#probe(current);
+          this.lastResult = {
+            available: true,
+            switched: false,
+            at: new Date().toISOString(),
+            reason,
+            current,
+            delay,
+          };
+          return this.lastResult;
+        } catch (err) {
+          this.logger.warn(`Clash 当前节点不可用: ${current}: ${err.message}`);
+        }
+      }
+
+      const candidates = this.candidates.filter(
+        (candidate) => candidate !== current && allowed.has(candidate) && !this.triedSelections.has(candidate)
+      );
+      for (const candidate of candidates) {
+        this.triedSelections.add(candidate);
+        try {
+          const delay = await this.#probe(candidate);
+          await this.#request(`/proxies/${encodeURIComponent(this.group)}`, 'PUT', { name: candidate });
+          this.currentSelection = candidate;
+          this.lastResult = {
+            available: true,
+            switched: true,
+            at: new Date().toISOString(),
+            reason,
+            from: current,
+            to: candidate,
+            delay,
+          };
+          this.logger.warn(
+            `Clash 恢复探测切换成功: ${this.group} ${current || 'unknown'} -> ${candidate}, Steam CM ${delay}ms`
+          );
+          return this.lastResult;
+        } catch (err) {
+          this.logger.warn(`Clash 恢复候选节点不可用: ${candidate}: ${err.message}`);
+        }
+      }
+
+      this.lastResult = {
+        available: false,
+        switched: false,
+        at: new Date().toISOString(),
+        reason,
+        from: current,
+        error: candidates.length === 0 ? '没有可用的候选节点' : '当前及候选节点均不可用',
+      };
+      return this.lastResult;
+    } catch (err) {
+      this.lastResult = {
+        available: false,
+        switched: false,
+        at: new Date().toISOString(),
+        reason,
+        error: err.message,
+      };
+      this.logger.error(`Clash 恢复探测失败: ${err.message}`);
+      return this.lastResult;
+    }
+  }
+
   async #failover(reason) {
     try {
       const group = await this.#request(`/proxies/${encodeURIComponent(this.group)}`);
@@ -69,21 +159,7 @@ class ClashFailover {
       for (const candidate of candidates) {
         this.triedSelections.add(candidate);
         try {
-          const query = new URLSearchParams({
-            timeout: String(this.timeoutMs),
-            url: this.testUrl,
-            expected: '200-299',
-          });
-          const probe = await this.#request(
-            `/proxies/${encodeURIComponent(candidate)}/delay?${query.toString()}`,
-            'GET',
-            null,
-            this.timeoutMs + 2000
-          );
-          const delay = Number(probe?.delay);
-          if (!Number.isFinite(delay) || delay <= 0) {
-            throw new Error('节点探测没有返回有效延迟');
-          }
+          const delay = await this.#probe(candidate);
 
           await this.#request(`/proxies/${encodeURIComponent(this.group)}`, 'PUT', { name: candidate });
           this.currentSelection = candidate;
@@ -122,6 +198,25 @@ class ClashFailover {
       this.logger.error(`Clash 节点故障转移失败: ${err.message}`);
       return this.lastResult;
     }
+  }
+
+  async #probe(candidate) {
+    const query = new URLSearchParams({
+      timeout: String(this.timeoutMs),
+      url: this.testUrl,
+      expected: '200-299',
+    });
+    const probe = await this.#request(
+      `/proxies/${encodeURIComponent(candidate)}/delay?${query.toString()}`,
+      'GET',
+      null,
+      this.timeoutMs + 2000
+    );
+    const delay = Number(probe?.delay);
+    if (!Number.isFinite(delay) || delay <= 0) {
+      throw new Error('节点探测没有返回有效延迟');
+    }
+    return delay;
   }
 
   #readSecret() {
