@@ -52,6 +52,7 @@ Copy-Item .env.example .env
 - `STEAM_AUTO_RELOGIN`：是否启用 `steam-user` 内建自动重连（默认 `false`，建议使用本项目自定义重连）
 - `STEAM_CRASH_ON_ERROR`：Steam 客户端出错时是否直接退出进程（默认 `false`，使用进程内分级重试和自动恢复）
 - `STEAM_RECOVERY_BASE_MS` / `STEAM_RECOVERY_MAX_MS`：连接连续失败后的恢复探测退避范围，默认从 1 分钟指数增长并封顶 30 分钟
+- `STEAM_RATE_LIMIT_RECOVERY_BASE_MS` / `STEAM_RATE_LIMIT_RECOVERY_MAX_MS`：Steam 限流后的长冷却范围，默认从 1 小时指数增长并封顶 6 小时
 
 如果网络环境导致 Steam 商店接口超时，可配置：
 
@@ -85,7 +86,7 @@ Compose 使用 host 网络访问宿主机上仅监听回环地址的 Clash SOCKS
 
 默认代理地址为 `socks5://127.0.0.1:7891`。如果服务器没有本机 Clash/Mihomo，删除 `compose.yaml` 中的 `STEAM_SOCKS_PROXY`、`STEAM_WEB_COMPATIBILITY_MODE` 和 `network_mode`，恢复端口映射部署。
 
-连接类错误（如 `NoConnection`、`ServiceUnavailable`、连接超时）发生时，服务会通过 Mihomo 控制接口测试候选节点，切换成功后再尝试登录。短重试达到上限后不会退出或永久熔断，而是按 1、2、4、8、16、30、30... 分钟自动恢复；每轮先探测 Steam CM，探测失败时不会发送登录请求，探测成功才尝试一次登录。认证拒绝、限流和 Steam Guard 仍会硬熔断，避免无效凭证造成登录风暴。
+连接类错误（如 `NoConnection`、`ServiceUnavailable`、连接超时）发生时，服务会通过 Mihomo 控制接口测试候选节点，切换成功后再尝试登录。短重试达到上限后不会退出或永久熔断，而是按 1、2、4、8、16、30、30... 分钟自动恢复；每轮先探测 Steam CM，探测失败时不会发送登录请求，探测成功才尝试一次登录。`RateLimitExceeded` 使用更保守的 1、2、4、6、6... 小时冷却后自动恢复。只有认证拒绝和 Steam Guard 会硬熔断。
 
 容器会挂载宿主机的 `.env` 和 `data/`。程序登录成功后更新的 `STEAM_REFRESH_TOKEN` 会立即用于后续重连并写回宿主机 `.env`；容器进程重启时也会直接读取该文件中的最新 token。SQLite 历史会保存在宿主机 `data/friend_game_history.db`。
 
@@ -116,7 +117,7 @@ Compose 使用 host 网络访问宿主机上仅监听回环地址的 Clash SOCKS
 
 仅当 Steam 已登录且好友状态完成首次加载时，健康检查返回 HTTP 200；未就绪或重连已熔断时返回 HTTP 503。`friendRelationshipCount` 是 Steam 返回的完整好友关系数量，`friendCount` 是已缓存状态数量。
 
-连接错误连续失败次数达到 `STEAM_MAX_CONSECUTIVE_FAILURES`（默认 3）后会进入低频自动恢复，不需要人工重启。`AccessDenied`、`RateLimitExceeded`、Steam Guard 或连续未知错误仍会停止自动重连；这类凭证/策略错误需要人工处理。健康接口会返回 `recoveryMode`、`recoveryAttempt`、`nextRecoveryAt` 和最近一次 `lastRecoveryProbe`，便于区分“正在恢复”和“永久停止”。
+连接错误连续失败次数达到 `STEAM_MAX_CONSECUTIVE_FAILURES` 后会进入低频自动恢复，不需要人工重启。生产 Compose 将阈值设为 2，避免短时间连续登录触发 Steam 限流。`RateLimitExceeded` 也会自动进入长冷却，只有 `AccessDenied`、Steam Guard 或连续未知错误会停止自动重连。健康接口会返回 `recoveryMode`、`recoveryKind`、`recoveryAttempt`、`nextRecoveryAt` 和最近一次 `lastRecoveryProbe`，便于区分网络恢复、限流冷却和永久停止。
 
 ### 好友状态列表
 

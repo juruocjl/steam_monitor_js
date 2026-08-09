@@ -7,6 +7,11 @@ const { HttpsProxyAgent } = require('hpagent');
 const sqlite3 = require('sqlite3').verbose();
 const { ClashFailover } = require('./clash-failover');
 const { calculateExponentialBackoff } = require('./recovery-backoff');
+const {
+  isConnectionLoginError,
+  isCredentialLoginError,
+  isRateLimitLoginError,
+} = require('./login-error');
 require('dotenv').config();
 
 const PORT = Number(process.env.PORT || 3000);
@@ -25,6 +30,14 @@ const STEAM_RECOVERY_BASE_MS = Math.max(1000, Number(process.env.STEAM_RECOVERY_
 const STEAM_RECOVERY_MAX_MS = Math.max(
   STEAM_RECOVERY_BASE_MS,
   Number(process.env.STEAM_RECOVERY_MAX_MS || 1800000)
+);
+const STEAM_RATE_LIMIT_RECOVERY_BASE_MS = Math.max(
+  60000,
+  Number(process.env.STEAM_RATE_LIMIT_RECOVERY_BASE_MS || 3600000)
+);
+const STEAM_RATE_LIMIT_RECOVERY_MAX_MS = Math.max(
+  STEAM_RATE_LIMIT_RECOVERY_BASE_MS,
+  Number(process.env.STEAM_RATE_LIMIT_RECOVERY_MAX_MS || 21600000)
 );
 const STEAM_LOGIN_TIMEOUT_MS = Number(process.env.STEAM_LOGIN_TIMEOUT_MS || 30000);
 const STEAM_MAX_CONSECUTIVE_FAILURES = Math.max(
@@ -80,6 +93,7 @@ let loginTimeoutTimer = null;
 let reconnectAttempt = 0;
 let recoveryAttempt = 0;
 let recoveryMode = false;
+let recoveryKind = null;
 let nextRecoveryAt = null;
 let lastRecoveryProbe = null;
 let loginAttemptId = 0;
@@ -144,19 +158,6 @@ function clearRecoveryTimer() {
   nextRecoveryAt = null;
 }
 
-function isNonRetryableLoginError(err, reason = '') {
-  const message = `${err?.message || ''} ${reason}`;
-  const eresult = Number(err?.eresult);
-  return eresult === 15 || eresult === 84 || /AccessDenied|RateLimitExceeded/i.test(message);
-}
-
-function isConnectionLoginError(err, reason = '') {
-  const message = `${err?.message || ''} ${reason}`;
-  return /NoConnection|ServiceUnavailable|Request timed out|login-timeout|timed?\s*out|ECONN|ENET|EHOST|socket|network|WebSocket/i.test(
-    message
-  );
-}
-
 async function scheduleReconnectAfterFailure(reason, err = null, forceConnectionFailure = false) {
   if (reconnectStopped || recoveryMode) {
     return;
@@ -180,6 +181,7 @@ async function scheduleReconnectAfterFailure(reason, err = null, forceConnection
 function stopAutomaticReconnect(reason) {
   reconnectStopped = true;
   recoveryMode = false;
+  recoveryKind = null;
   nextRecoveryAt = null;
   lastLoginError = reason;
   isLoggingOn = false;
@@ -187,7 +189,7 @@ function stopAutomaticReconnect(reason) {
   clearRecoveryTimer();
   clearLoginTimeoutTimer();
   console.error(
-    `Steam 自动重连已停止: ${reason}。请更新登录凭证或排查 Steam 限流后，人工重启服务。`
+    `Steam 自动重连已停止: ${reason}。请更新登录凭证后人工重启服务。`
   );
 }
 
@@ -204,9 +206,14 @@ function recordLoginFailure(reason, err = null, forceConnectionFailure = false) 
     lastCountedFailureAttemptId = loginAttemptId;
   }
 
-  if (isNonRetryableLoginError(err, reason)) {
-    stopAutomaticReconnect(`不可重试的登录错误: ${reason}`);
+  if (isCredentialLoginError(err, reason)) {
+    stopAutomaticReconnect(`凭证被拒绝: ${reason}`);
     return 'stopped';
+  }
+
+  if (isRateLimitLoginError(err, reason)) {
+    console.warn(`Steam 登录被限流，进入长冷却自动恢复模式: ${reason}`);
+    return 'rate-limit';
   }
 
   if (alreadyCounted) {
@@ -243,6 +250,8 @@ function handleLoginFailure(reason, err = null, forceConnectionFailure = false) 
     void scheduleReconnectAfterFailure(reason, err, forceConnectionFailure);
   } else if (outcome === 'recovery') {
     scheduleRecovery(reason);
+  } else if (outcome === 'rate-limit') {
+    scheduleRecovery(reason, 'rate-limit');
   }
 }
 
@@ -275,7 +284,13 @@ async function runRecoveryProbe(reason, attempt) {
   doLogOn(`自动恢复第${attempt}轮`);
 }
 
-function scheduleRecovery(reason) {
+function scheduleRecovery(reason, requestedKind = null) {
+  if (requestedKind === 'rate-limit') {
+    recoveryKind = 'rate-limit';
+  } else if (!recoveryMode) {
+    recoveryKind = 'network';
+  }
+
   if (reconnectStopped || isLoggedOn || recoveryTimer) {
     return;
   }
@@ -286,10 +301,13 @@ function scheduleRecovery(reason) {
   clearLoginTimeoutTimer();
   recoveryAttempt += 1;
   const attempt = recoveryAttempt;
-  const delay = calculateExponentialBackoff(attempt, STEAM_RECOVERY_BASE_MS, STEAM_RECOVERY_MAX_MS);
+  const rateLimited = recoveryKind === 'rate-limit';
+  const baseMs = rateLimited ? STEAM_RATE_LIMIT_RECOVERY_BASE_MS : STEAM_RECOVERY_BASE_MS;
+  const maxMs = rateLimited ? STEAM_RATE_LIMIT_RECOVERY_MAX_MS : STEAM_RECOVERY_MAX_MS;
+  const delay = calculateExponentialBackoff(attempt, baseMs, maxMs);
   nextRecoveryAt = new Date(Date.now() + delay).toISOString();
   console.warn(
-    `已计划第 ${attempt} 轮自动恢复，${delay}ms 后先探测 Steam 通路，原因: ${reason}`
+    `已计划第 ${attempt} 轮${rateLimited ? '限流冷却' : ''}自动恢复，${delay}ms 后先探测 Steam 通路，原因: ${reason}`
   );
 
   recoveryTimer = setTimeout(() => {
@@ -1033,7 +1051,7 @@ function startHeartbeat() {
 
   heartbeatTimer = setInterval(() => {
     console.log(
-      `[heartbeat] loggedOn=${isLoggedOn} friendStatusReady=${hasFriendStatusReady} recoveryMode=${recoveryMode} recoveryAttempt=${recoveryAttempt} nextRecoveryAt=${nextRecoveryAt || ''} friends=${friendStatuses.size} playing=${getPlayingFriendCount()} botSteamId=${botSteamId || ''}`
+      `[heartbeat] loggedOn=${isLoggedOn} friendStatusReady=${hasFriendStatusReady} recoveryMode=${recoveryMode} recoveryKind=${recoveryKind || ''} recoveryAttempt=${recoveryAttempt} nextRecoveryAt=${nextRecoveryAt || ''} friends=${friendStatuses.size} playing=${getPlayingFriendCount()} botSteamId=${botSteamId || ''}`
     );
   }, HEARTBEAT_INTERVAL_MS);
   heartbeatTimer.unref?.();
@@ -1047,10 +1065,13 @@ app.get('/api/health', (req, res) => {
     friendStatusReady: hasFriendStatusReady,
     reconnectStopped,
     recoveryMode,
+    recoveryKind,
     recoveryAttempt,
     nextRecoveryAt,
     recoveryBaseMs: STEAM_RECOVERY_BASE_MS,
     recoveryMaxMs: STEAM_RECOVERY_MAX_MS,
+    rateLimitRecoveryBaseMs: STEAM_RATE_LIMIT_RECOVERY_BASE_MS,
+    rateLimitRecoveryMaxMs: STEAM_RATE_LIMIT_RECOVERY_MAX_MS,
     lastRecoveryProbe,
     consecutiveLoginFailures,
     maxConsecutiveLoginFailures: STEAM_MAX_CONSECUTIVE_FAILURES,
@@ -1156,6 +1177,7 @@ client.on('loggedOn', () => {
   isLoggingOn = false;
   reconnectStopped = false;
   recoveryMode = false;
+  recoveryKind = null;
   recoveryAttempt = 0;
   nextRecoveryAt = null;
   consecutiveLoginFailures = 0;
@@ -1288,7 +1310,7 @@ async function start() {
     `Clash 自动故障转移: enabled=${CLASH_AUTO_FAILOVER_ENABLED} group=${clashFailover.group} candidates=${CLASH_FAILOVER_CANDIDATES.join(',')}`
   );
   console.log(
-    `Steam 自动恢复: quickFailures=${STEAM_MAX_CONSECUTIVE_FAILURES} recoveryBaseMs=${STEAM_RECOVERY_BASE_MS} recoveryMaxMs=${STEAM_RECOVERY_MAX_MS}`
+    `Steam 自动恢复: quickFailures=${STEAM_MAX_CONSECUTIVE_FAILURES} recoveryBaseMs=${STEAM_RECOVERY_BASE_MS} recoveryMaxMs=${STEAM_RECOVERY_MAX_MS} rateLimitBaseMs=${STEAM_RATE_LIMIT_RECOVERY_BASE_MS} rateLimitMaxMs=${STEAM_RATE_LIMIT_RECOVERY_MAX_MS}`
   );
   cachedLogOnOptions = buildLogOnOptions();
   doLogOn('初次启动');
