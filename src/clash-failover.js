@@ -31,6 +31,7 @@ class ClashFailover {
     return {
       enabled: this.enabled,
       group: this.enabled ? this.group : null,
+      dynamicCandidates: this.candidates.includes('*'),
       currentSelection: this.currentSelection,
       triedSelections: Array.from(this.triedSelections),
       lastResult: this.lastResult,
@@ -93,9 +94,7 @@ class ClashFailover {
         }
       }
 
-      const candidates = this.candidates.filter(
-        (candidate) => candidate !== current && allowed.has(candidate) && !this.triedSelections.has(candidate)
-      );
+      const candidates = this.#getCandidates(allowed, current);
       for (const candidate of candidates) {
         this.triedSelections.add(candidate);
         try {
@@ -152,9 +151,7 @@ class ClashFailover {
         this.triedSelections.add(current);
       }
 
-      const candidates = this.candidates.filter(
-        (candidate) => candidate !== current && allowed.has(candidate) && !this.triedSelections.has(candidate)
-      );
+      const candidates = this.#getCandidates(allowed, current);
 
       for (const candidate of candidates) {
         this.triedSelections.add(candidate);
@@ -217,6 +214,14 @@ class ClashFailover {
       throw new Error('节点探测没有返回有效延迟');
     }
     return delay;
+  }
+
+  #getCandidates(allowed, current) {
+    const configured = this.candidates.filter((candidate) => candidate !== '*');
+    const pool = this.candidates.includes('*') ? [...configured, ...allowed] : configured;
+    return Array.from(new Set(pool)).filter(
+      (candidate) => candidate !== current && allowed.has(candidate) && !this.triedSelections.has(candidate)
+    );
   }
 
   #readSecret() {

@@ -143,3 +143,57 @@ test('recovery probe switches only after the current selection fails', async (t)
   assert.equal(result.delay, 88);
   assert.deepEqual(switches, ['Fallback']);
 });
+
+test('wildcard candidates discover nodes from the selected Clash group', async (t) => {
+  let selected = 'Dead node';
+  const switches = [];
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, 'http://127.0.0.1');
+    if (req.method === 'GET' && url.pathname === '/proxies/%F0%9F%A7%B1%20GFW') {
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ type: 'Selector', now: selected, all: ['Dead node', 'Healthy node'] }));
+      return;
+    }
+    if (req.method === 'GET' && url.pathname === '/proxies/Dead%20node/delay') {
+      res.statusCode = 504;
+      res.end('timeout');
+      return;
+    }
+    if (req.method === 'GET' && url.pathname === '/proxies/Healthy%20node/delay') {
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ delay: 77 }));
+      return;
+    }
+    if (req.method === 'PUT' && url.pathname === '/proxies/%F0%9F%A7%B1%20GFW') {
+      const chunks = [];
+      req.on('data', (chunk) => chunks.push(chunk));
+      req.on('end', () => {
+        selected = JSON.parse(Buffer.concat(chunks).toString('utf8')).name;
+        switches.push(selected);
+        res.statusCode = 204;
+        res.end();
+      });
+      return;
+    }
+    res.statusCode = 404;
+    res.end();
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => server.close());
+
+  const failover = new ClashFailover({
+    enabled: true,
+    controllerUrl: `http://127.0.0.1:${server.address().port}`,
+    group: '🧱 GFW',
+    candidates: ['*'],
+    timeoutMs: 1000,
+    logger: { warn() {}, error() {} },
+  });
+
+  const result = await failover.ensureAvailable('dynamic-recovery');
+  assert.equal(result.available, true);
+  assert.equal(result.switched, true);
+  assert.equal(result.to, 'Healthy node');
+  assert.deepEqual(switches, ['Healthy node']);
+  assert.equal(failover.snapshot().dynamicCandidates, true);
+});
