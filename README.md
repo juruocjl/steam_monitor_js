@@ -74,22 +74,11 @@ npm start
 
 ### Docker 部署
 
-服务端推荐使用 Docker Compose 运行，让 Docker 负责自动重启：
-
-```bash
-mkdir -p data
-docker compose up -d --build
-```
-
-Compose 使用 host 网络访问宿主机上仅监听回环地址的 Clash SOCKS 端口，并将 API 仅监听在宿主机本地：
-
-- `http://127.0.0.1:5555`
-
-默认代理地址为 `socks5://127.0.0.1:7891`。如果服务器没有本机 Clash/Mihomo，删除 `compose.yaml` 中的 `STEAM_SOCKS_PROXY`、`STEAM_WEB_COMPATIBILITY_MODE` 和 `network_mode`，恢复端口映射部署。
-
-连接类错误（如 `NoConnection`、`ServiceUnavailable`、连接超时）发生时，服务会通过 Mihomo 控制接口测试候选节点，切换成功后再尝试登录。短重试达到上限后不会退出或永久熔断，而是按 1、2、4、8、16、30、30... 分钟自动恢复；每轮先探测 Steam CM，探测失败时不会发送登录请求，探测成功才尝试一次登录。`RateLimitExceeded` 使用更保守的 1、2、4、6、6... 小时冷却后自动恢复。只有认证拒绝和 Steam Guard 会硬熔断。
-
-容器会挂载宿主机的 `.env` 和 `data/`。程序登录成功后更新的 `STEAM_REFRESH_TOKEN` 会立即用于后续重连并写回宿主机 `.env`；容器进程重启时也会直接读取该文件中的最新 token。SQLite 历史会保存在宿主机 `data/friend_game_history.db`。
+生产部署、代理依赖、持久化和恢复流程统一维护在
+[csbot-depoly 根目录部署手册](https://github.com/juruocjl/csbot-depoly/blob/main/DEPLOY.md#steam-monitor-部署)。
+服务器清单见 [SERVER_SERVICES.md](https://github.com/juruocjl/csbot-depoly/blob/main/SERVER_SERVICES.md)，
+执行约束见 [AGENTS.md](https://github.com/juruocjl/csbot-depoly/blob/main/AGENTS.md)。
+在部署仓库的子模块布局中，这些文档位于本目录的上一层。
 
 ## 4. API 说明
 
