@@ -1,4 +1,4 @@
-FROM node:22-bookworm AS dependencies
+FROM node:22.23.4-bookworm AS dependencies
 
 WORKDIR /app
 
@@ -9,7 +9,7 @@ RUN apt-get update \
   && npm_config_build_from_source=true npm_config_nodedir=/usr/local npm ci --omit=dev \
   && npm cache clean --force
 
-FROM node:22-bookworm
+FROM node:22.23.4-bookworm
 
 WORKDIR /app
 
