@@ -3,10 +3,8 @@ FROM node:22.23.4-bookworm AS dependencies
 WORKDIR /app
 
 COPY package*.json ./
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends python3 make g++ \
-  && rm -rf /var/lib/apt/lists/* \
-  && npm_config_build_from_source=true npm_config_nodedir=/usr/local npm ci --omit=dev \
+# The full bookworm image includes python3, make and g++ via buildpack-deps.
+RUN npm_config_build_from_source=true npm_config_nodedir=/usr/local npm ci --omit=dev \
   && npm cache clean --force
 
 FROM node:22.23.4-bookworm
