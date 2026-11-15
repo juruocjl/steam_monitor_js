@@ -47,9 +47,9 @@ Copy-Item .env.example .env
 - `STEAM_SOCKS_PROXY`：Steam 登录连接使用的 SOCKS4/5 代理
 - `STEAM_WEB_COMPATIBILITY_MODE`：强制使用 WebSocket 443；配置 SOCKS 代理时默认启用
 - `CLASH_AUTO_FAILOVER_ENABLED`：连接失败时先探测并切换 Clash 节点，再进行一次受控重连
-- `CLASH_FAILOVER_GROUP` / `CLASH_FAILOVER_CANDIDATES`：要切换的选择器及按顺序尝试的候选组
-- `CLASH_UPSTREAM_GROUPS`：关联的上游 `Selector` 组列表（默认 `Steam`），若偏离到单节点或其它组则自动对齐回 `CLASH_FAILOVER_GROUP`
-- `CLASH_FAILOVER_CANDIDATES=*`：动态枚举策略组内真实落地节点（自动排除 `Auto`/`Fallback`/`Selector` 等嵌套策略组与 `DIRECT`/`REJECT` 虚拟节点）
+- `CLASH_FAILOVER_GROUP` / `CLASH_FAILOVER_CANDIDATES`：要切换的选择器及按顺序尝试的候选组；`CLASH_FAILOVER_GROUP=auto`（默认）或配置的组名不存在时，自动结合 `/proxies` 与 `/rules` 识别当前订阅的主 `Selector` 策略组
+- `CLASH_UPSTREAM_GROUPS`：关联的上游 `Selector` 组列表（默认 `Steam,Final`），存在且包含主策略组时自动对齐，不存在时自动跳过；留空关闭
+- `CLASH_FAILOVER_CANDIDATES=*`：动态枚举策略组内真实落地节点（自动排除 `Auto`/`Fallback`/`Selector` 等嵌套策略组、`DIRECT`/`REJECT` 虚拟节点，以及剩余流量/重置/到期/官网等机场信息展示假节点）
 - `CLASH_FAILED_NODE_COOLDOWN_MS` / `CLASH_FAILOVER_CM_TEST_URLS`：实际登录失败节点的跨恢复轮冷却时间（默认 30 分钟），以及 `STEAM_WEB_COMPATIBILITY_MODE` 下的 Steam CM `:443` 增强探测列表（全部失效时安全降级回 Web API 候选并由登录成败驱动轮换）
 - `STEAM_GUARD_CODE`：可选，一次性 Steam Guard 验证码（更推荐使用 `STEAM_REFRESH_TOKEN`）
 - `STEAM_AUTO_RELOGIN`：是否启用 `steam-user` 内建自动重连（默认 `false`，建议使用本项目自定义重连）
@@ -107,7 +107,7 @@ npm start
 }
 ```
 
-仅当 Steam 已登录且好友状态完成首次加载时，健康检查返回 HTTP 200；未就绪或重连已熔断时返回 HTTP 503。`friendRelationshipCount` 是 Steam 返回的完整好友关系数量，`friendCount` 是已缓存状态数量。
+仅当 Steam 已登录且好友状态完成首次加载时，健康检查返回 HTTP 200；未就绪或重连已熔断时返回 HTTP 503。`friendRelationshipCount` 是 Steam 返回的完整好友关系数量，`friendCount` 是已缓存状态数量。`clashFailover` 对象会暴露 `group`、`resolvedGroup`、`resolvedGroupSource`、`eligibleCandidateCount`、`filteredInfoNodes` 与 `currentSelection` 等自适应故障转移可观测字段。
 
 连接错误连续失败次数达到 `STEAM_MAX_CONSECUTIVE_FAILURES` 后会进入低频自动恢复，不需要人工重启。生产 Compose 将阈值设为 2，避免短时间连续登录触发 Steam 限流。`RateLimitExceeded` 也会自动进入长冷却，只有 `AccessDenied`、Steam Guard 或连续未知错误会停止自动重连。健康接口会返回 `recoveryMode`、`recoveryKind`、`recoveryAttempt`、`nextRecoveryAt` 和最近一次 `lastRecoveryProbe`，便于区分网络恢复、限流冷却和永久停止。
 

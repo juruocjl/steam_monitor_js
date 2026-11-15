@@ -4,7 +4,12 @@ const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
-const { ClashFailover, parseClashSecret } = require('../src/clash-failover');
+const {
+  ClashFailover,
+  isInfoProxyName,
+  parseClashSecret,
+  resolvePrimaryGroup,
+} = require('../src/clash-failover');
 
 test('parseClashSecret supports quoted and plain YAML values', () => {
   assert.equal(parseClashSecret('secret: "abc123"\n'), 'abc123');
@@ -620,4 +625,353 @@ test('failed node cooldown expires and single-node pool falls back to current wh
   assert.equal(expiredRes.available, true);
   assert.equal(expiredRes.switched, false);
   assert.equal(failover.snapshot().failedSelections.length, 0);
+});
+
+test('isInfoProxyName filters informational fake nodes while preserving real proxy nodes', () => {
+  const fakeNodes = [
+    '剩余流量：146.48 GB',
+    '距离下次重置剩余：27 天',
+    '套餐到期：2027-05-12',
+    'youtunice.com',
+    'Website: wpku.org',
+    'Telegram: t.me/wallesspku',
+    'Balance: 20.00 GiB',
+    '2026-11-01 00:00:02 (UTC+8)',
+    '官网：example.org',
+    '公告：请更新订阅',
+  ];
+  for (const name of fakeNodes) {
+    assert.equal(isInfoProxyName(name), true, `expected info node to be filtered: ${name}`);
+  }
+
+  const realNodes = [
+    '高速隧道1x-新加坡-4',
+    '专线2.5x-香港-1',
+    '🇺🇸 US-G1 (0.6x)',
+    '🇭🇰 Hong Kong 06',
+    '[youtunice.com] 香港 01',
+    'HK.BGP',
+  ];
+  for (const name of realNodes) {
+    assert.equal(isInfoProxyName(name), false, `expected real node to be preserved: ${name}`);
+  }
+});
+
+test('auto group resolves 悠兔 style subscription, filters fake nodes, and switches cleanly', async (t) => {
+  let selected = '剩余流量：146.48 GB';
+  const probed = [];
+  const switches = [];
+
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, 'http://127.0.0.1');
+    if (req.method === 'GET' && url.pathname === '/proxies') {
+      res.setHeader('Content-Type', 'application/json');
+      res.end(
+        JSON.stringify({
+          proxies: {
+            GLOBAL: { type: 'Selector', now: 'DIRECT', all: ['DIRECT', 'REJECT', '悠兔', '自动选择', '故障转移'] },
+            '悠兔': {
+              type: 'Selector',
+              now: selected,
+              all: [
+                '自动选择',
+                '故障转移',
+                'DIRECT',
+                '剩余流量：146.48 GB',
+                '距离下次重置剩余：27 天',
+                '套餐到期：2027-05-12',
+                'youtunice.com',
+                '专线2.5x-香港-1',
+                '高速隧道1x-新加坡-4',
+              ],
+            },
+            '自动选择': { type: 'URLTest', now: '专线2.5x-香港-1', all: ['专线2.5x-香港-1', '高速隧道1x-新加坡-4'] },
+            '故障转移': { type: 'Fallback', now: '专线2.5x-香港-1', all: ['专线2.5x-香港-1', '高速隧道1x-新加坡-4'] },
+            DIRECT: { type: 'Direct' },
+            '剩余流量：146.48 GB': { type: 'Shadowsocks' },
+            '距离下次重置剩余：27 天': { type: 'Shadowsocks' },
+            '套餐到期：2027-05-12': { type: 'Shadowsocks' },
+            'youtunice.com': { type: 'Shadowsocks' },
+            '专线2.5x-香港-1': { type: 'Shadowsocks' },
+            '高速隧道1x-新加坡-4': { type: 'Shadowsocks' },
+          },
+        })
+      );
+      return;
+    }
+    if (req.method === 'GET' && /^\/proxies\/[^/]+\/delay$/.test(url.pathname)) {
+      const node = decodeURIComponent(url.pathname.split('/')[2]);
+      probed.push(node);
+      if (node === '专线2.5x-香港-1') {
+        res.statusCode = 504;
+        res.end('timeout');
+        return;
+      }
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ delay: 112 }));
+      return;
+    }
+    if (req.method === 'PUT' && url.pathname === '/proxies/%E6%82%A0%E5%85%94') {
+      const chunks = [];
+      req.on('data', (chunk) => chunks.push(chunk));
+      req.on('end', () => {
+        selected = JSON.parse(Buffer.concat(chunks).toString('utf8')).name;
+        switches.push(selected);
+        res.statusCode = 204;
+        res.end();
+      });
+      return;
+    }
+    res.statusCode = 404;
+    res.end();
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => server.close());
+
+  const failover = new ClashFailover({
+    enabled: true,
+    controllerUrl: `http://127.0.0.1:${server.address().port}`,
+    group: 'auto',
+    upstreamGroups: ['Steam', 'Final'],
+    candidates: ['*'],
+    timeoutMs: 1000,
+    logger: { warn() {}, error() {} },
+  });
+
+  const aligned = await failover.ensureUpstreamAligned();
+  assert.deepEqual(aligned, []);
+
+  const initialSnap = failover.snapshot();
+  assert.equal(initialSnap.group, 'auto');
+  assert.equal(initialSnap.resolvedGroup, '悠兔');
+  assert.equal(initialSnap.resolvedGroupSource, 'auto');
+  assert.equal(initialSnap.currentSelection, '剩余流量：146.48 GB');
+  assert.equal(initialSnap.eligibleCandidateCount, 2);
+  assert.deepEqual(initialSnap.filteredInfoNodes, [
+    '剩余流量：146.48 GB',
+    '距离下次重置剩余：27 天',
+    '套餐到期：2027-05-12',
+    'youtunice.com',
+  ]);
+
+  const recovered = await failover.ensureAvailable('migrate-off-info-node');
+  assert.equal(recovered.available, true);
+  assert.equal(recovered.switched, true);
+  assert.equal(recovered.group, '悠兔');
+  assert.equal(recovered.from, '剩余流量：146.48 GB');
+  assert.equal(recovered.to, '高速隧道1x-新加坡-4');
+  assert.deepEqual(probed, ['专线2.5x-香港-1', '高速隧道1x-新加坡-4']);
+  assert.deepEqual(switches, ['高速隧道1x-新加坡-4']);
+
+  const fo = await failover.failover('node-down');
+  assert.equal(fo.switched, false);
+  assert.equal(fo.group, '悠兔');
+  assert.equal(probed.some((name) => isInfoProxyName(name)), false);
+});
+
+test('configured missing group falls back cleanly and resets cycle across live subscription switch', async (t) => {
+  let profile = 'eix';
+  let eixNow = 'HK 01';
+  let youtuNow = '新加坡-1';
+  const warnings = [];
+
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, 'http://127.0.0.1');
+    if (req.method === 'GET' && url.pathname === '/proxies') {
+      res.setHeader('Content-Type', 'application/json');
+      if (profile === 'eix') {
+        res.end(
+          JSON.stringify({
+            proxies: {
+              GLOBAL: { type: 'Selector', now: 'E-IX', all: ['E-IX', 'HK 01', 'JP 02'] },
+              'E-IX': { type: 'Selector', now: eixNow, all: ['HK 01', 'JP 02'] },
+              'HK 01': { type: 'AnyTLS' },
+              'JP 02': { type: 'AnyTLS' },
+            },
+          })
+        );
+      } else {
+        res.end(
+          JSON.stringify({
+            proxies: {
+              GLOBAL: { type: 'Selector', now: '悠兔', all: ['悠兔', '新加坡-1', '香港-2'] },
+              '悠兔': { type: 'Selector', now: youtuNow, all: ['剩余流量：100 GB', '新加坡-1', '香港-2'] },
+              '剩余流量：100 GB': { type: 'Shadowsocks' },
+              '新加坡-1': { type: 'Shadowsocks' },
+              '香港-2': { type: 'Shadowsocks' },
+            },
+          })
+        );
+      }
+      return;
+    }
+    if (req.method === 'GET' && /^\/proxies\/[^/]+\/delay$/.test(url.pathname)) {
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ delay: 80 }));
+      return;
+    }
+    if (req.method === 'PUT' && url.pathname === '/proxies/E-IX') {
+      const chunks = [];
+      req.on('data', (chunk) => chunks.push(chunk));
+      req.on('end', () => {
+        eixNow = JSON.parse(Buffer.concat(chunks).toString('utf8')).name;
+        res.statusCode = 204;
+        res.end();
+      });
+      return;
+    }
+    if (req.method === 'PUT' && url.pathname === '/proxies/%E6%82%A0%E5%85%94') {
+      const chunks = [];
+      req.on('data', (chunk) => chunks.push(chunk));
+      req.on('end', () => {
+        youtuNow = JSON.parse(Buffer.concat(chunks).toString('utf8')).name;
+        res.statusCode = 204;
+        res.end();
+      });
+      return;
+    }
+    res.statusCode = 404;
+    res.end();
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => server.close());
+
+  const failover = new ClashFailover({
+    enabled: true,
+    controllerUrl: `http://127.0.0.1:${server.address().port}`,
+    group: 'E-IX',
+    candidates: ['*'],
+    timeoutMs: 1000,
+    logger: { warn: (msg) => warnings.push(msg), error() {} },
+  });
+
+  await failover.ensureUpstreamAligned();
+  assert.equal(failover.snapshot().resolvedGroup, 'E-IX');
+  assert.equal(failover.snapshot().resolvedGroupSource, 'configured');
+
+  // Record a failure on E-IX before switching subscription
+  failover.recordLoginFailure('login-timeout-reset', 'HK 01');
+  const firstSwitch = await failover.ensureAvailable('pre-sub-switch');
+  assert.equal(firstSwitch.to, 'JP 02');
+  assert.equal(failover.snapshot().failedSelections.length, 1);
+
+  // Live switch subscription from E-IX to 悠兔 while group config is still E-IX
+  profile = 'youtu';
+  const fallbackRes = await failover.failover('post-sub-switch');
+  assert.equal(fallbackRes.switched, true);
+  assert.equal(fallbackRes.group, '悠兔');
+  assert.equal(fallbackRes.from, '新加坡-1');
+  assert.equal(fallbackRes.to, '香港-2');
+
+  const snap = failover.snapshot();
+  assert.equal(snap.resolvedGroup, '悠兔');
+  assert.equal(snap.resolvedGroupSource, 'fallback');
+  assert.equal(snap.failedSelections.length, 0);
+  assert.equal(snap.eligibleCandidateCount, 2);
+  assert.deepEqual(snap.filteredInfoNodes, ['剩余流量：100 GB']);
+  assert.ok(warnings.some((msg) => msg.includes('自动回退到当前订阅主策略组: 悠兔')));
+});
+
+test('resolvePrimaryGroup and upstream alignment handle E-IX and GFW multi-selector topologies', async (t) => {
+  // 1. Direct resolvePrimaryGroup on 🧱 GFW topology (Match -> DIRECT, Info + Accel + GFW)
+  const gfwProxies = {
+    GLOBAL: { type: 'Selector', all: ['DIRECT', '🧱 GFW', '🔔 Info', '🚀 Accel.'] },
+    '🔔 Info': {
+      type: 'Selector',
+      all: ['Website: wpku.org', 'Telegram: t.me/wallesspku', 'Balance: 20.00 GiB', '2026-11-01 00:00:02 (UTC+8)'],
+    },
+    '🚀 Accel.': { type: 'Selector', all: ['DIRECT', '🧱 GFW'] },
+    '🧱 GFW': { type: 'Selector', all: ['🇺🇸 US-G1 (0.6x)', '🇯🇵 JP-Z1 (0.8x)'] },
+    'Website: wpku.org': { type: 'Shadowsocks' },
+    'Telegram: t.me/wallesspku': { type: 'Shadowsocks' },
+    'Balance: 20.00 GiB': { type: 'Shadowsocks' },
+    '2026-11-01 00:00:02 (UTC+8)': { type: 'Shadowsocks' },
+    '🇺🇸 US-G1 (0.6x)': { type: 'Shadowsocks' },
+    '🇯🇵 JP-Z1 (0.8x)': { type: 'Shadowsocks' },
+  };
+  const gfwRules = [
+    { type: 'DomainSuffix', payload: 'steampowered.com', proxy: '🧱 GFW' },
+    { type: 'Match', payload: '', proxy: 'DIRECT' },
+  ];
+  assert.equal(resolvePrimaryGroup(gfwProxies, gfwRules), '🧱 GFW');
+
+  // 2. E-IX topology (Match -> Final delegating to E-IX, Steam + Final + AI selectors)
+  let eixNow = '🇭🇰 Hong Kong 06';
+  let steamNow = '🇭🇰 Hong Kong 06';
+  let finalNow = 'Auto';
+  const upstreamSwitches = [];
+
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, 'http://127.0.0.1');
+    if (req.method === 'GET' && url.pathname === '/proxies') {
+      res.setHeader('Content-Type', 'application/json');
+      res.end(
+        JSON.stringify({
+          proxies: {
+            GLOBAL: { type: 'Selector', all: ['Final', 'E-IX', 'Steam', 'AI'] },
+            'E-IX': { type: 'Selector', now: eixNow, all: ['Fallback', 'Auto', '🇭🇰 Hong Kong 06', '🇯🇵 Japan 01'] },
+            Steam: { type: 'Selector', now: steamNow, all: ['E-IX', 'Fallback', 'Auto', 'DIRECT', '🇭🇰 Hong Kong 06', '🇯🇵 Japan 01'] },
+            AI: { type: 'Selector', now: 'E-IX', all: ['E-IX', 'Fallback', 'Auto', '🇭🇰 Hong Kong 06', '🇯🇵 Japan 01'] },
+            Final: { type: 'Selector', now: finalNow, all: ['E-IX', 'Fallback', 'Auto', 'DIRECT', '🇭🇰 Hong Kong 06', '🇯🇵 Japan 01'] },
+            Auto: { type: 'URLTest', all: ['🇭🇰 Hong Kong 06', '🇯🇵 Japan 01'] },
+            Fallback: { type: 'Fallback', all: ['🇭🇰 Hong Kong 06', '🇯🇵 Japan 01'] },
+            '🇭🇰 Hong Kong 06': { type: 'AnyTLS' },
+            '🇯🇵 Japan 01': { type: 'AnyTLS' },
+          },
+        })
+      );
+      return;
+    }
+    if (req.method === 'GET' && url.pathname === '/rules') {
+      res.setHeader('Content-Type', 'application/json');
+      res.end(
+        JSON.stringify({
+          rules: [
+            { type: 'DomainSuffix', payload: 'steampowered.com', proxy: 'Steam' },
+            { type: 'Match', payload: '', proxy: 'Final' },
+          ],
+        })
+      );
+      return;
+    }
+    if (req.method === 'PUT' && /^\/proxies\/(Steam|Final)$/.test(url.pathname)) {
+      const targetGroup = decodeURIComponent(url.pathname.split('/')[2]);
+      const chunks = [];
+      req.on('data', (chunk) => chunks.push(chunk));
+      req.on('end', () => {
+        const name = JSON.parse(Buffer.concat(chunks).toString('utf8')).name;
+        if (targetGroup === 'Steam') steamNow = name;
+        if (targetGroup === 'Final') finalNow = name;
+        upstreamSwitches.push([targetGroup, name]);
+        res.statusCode = 204;
+        res.end();
+      });
+      return;
+    }
+    res.statusCode = 404;
+    res.end();
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => server.close());
+
+  const failover = new ClashFailover({
+    enabled: true,
+    controllerUrl: `http://127.0.0.1:${server.address().port}`,
+    group: 'auto',
+    upstreamGroups: ['Steam', 'Final'],
+    candidates: ['*'],
+    timeoutMs: 1000,
+    logger: { warn() {}, error() {} },
+  });
+
+  const aligned = await failover.ensureUpstreamAligned();
+  assert.equal(failover.snapshot().resolvedGroup, 'E-IX');
+  assert.deepEqual(aligned, [
+    { group: 'Steam', from: '🇭🇰 Hong Kong 06', to: 'E-IX' },
+    { group: 'Final', from: 'Auto', to: 'E-IX' },
+  ]);
+  assert.deepEqual(upstreamSwitches, [
+    ['Steam', 'E-IX'],
+    ['Final', 'E-IX'],
+  ]);
 });

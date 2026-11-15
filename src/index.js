@@ -60,7 +60,7 @@ const CLASH_UPSTREAM_GROUPS =
     ? process.env.CLASH_UPSTREAM_GROUPS.split(',')
         .map((value) => value.trim())
         .filter(Boolean)
-    : ['Steam'];
+    : ['Steam', 'Final'];
 const CLASH_FAILED_NODE_COOLDOWN_MS = Math.max(
   1000,
   Number(process.env.CLASH_FAILED_NODE_COOLDOWN_MS || 1800000)
@@ -83,7 +83,7 @@ const clashFailover = new ClashFailover({
   enabled: CLASH_AUTO_FAILOVER_ENABLED,
   controllerUrl: process.env.CLASH_CONTROLLER_URL,
   secretFile: process.env.CLASH_CONTROLLER_SECRET_FILE,
-  group: process.env.CLASH_FAILOVER_GROUP || 'E-IX',
+  group: process.env.CLASH_FAILOVER_GROUP || 'auto',
   upstreamGroups: CLASH_UPSTREAM_GROUPS,
   candidates: CLASH_FAILOVER_CANDIDATES,
   testUrl: process.env.CLASH_FAILOVER_TEST_URL,
@@ -1351,6 +1351,12 @@ async function start() {
     `Steam 自动恢复: quickFailures=${STEAM_MAX_CONSECUTIVE_FAILURES} recoveryBaseMs=${STEAM_RECOVERY_BASE_MS} recoveryMaxMs=${STEAM_RECOVERY_MAX_MS} rateLimitBaseMs=${STEAM_RATE_LIMIT_RECOVERY_BASE_MS} rateLimitMaxMs=${STEAM_RATE_LIMIT_RECOVERY_MAX_MS}`
   );
   await clashFailover.ensureUpstreamAligned();
+  if (CLASH_AUTO_FAILOVER_ENABLED) {
+    const clashSnapshot = clashFailover.snapshot();
+    console.log(
+      `Clash 主策略组解析: configured=${clashSnapshot.group} resolved=${clashSnapshot.resolvedGroup || 'unresolved'} source=${clashSnapshot.resolvedGroupSource || 'none'} current=${clashSnapshot.currentSelection || 'none'} eligible=${clashSnapshot.eligibleCandidateCount ?? 0} filteredInfo=${clashSnapshot.filteredInfoNodes.length}`
+    );
+  }
   cachedLogOnOptions = buildLogOnOptions();
   doLogOn('初次启动');
 
