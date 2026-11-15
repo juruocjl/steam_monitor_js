@@ -48,7 +48,9 @@ Copy-Item .env.example .env
 - `STEAM_WEB_COMPATIBILITY_MODE`：强制使用 WebSocket 443；配置 SOCKS 代理时默认启用
 - `CLASH_AUTO_FAILOVER_ENABLED`：连接失败时先探测并切换 Clash 节点，再进行一次受控重连
 - `CLASH_FAILOVER_GROUP` / `CLASH_FAILOVER_CANDIDATES`：要切换的选择器及按顺序尝试的候选组
-- `CLASH_FAILOVER_CANDIDATES=*`：动态枚举策略组内全部候选，订阅更新导致节点增删时无需修改应用配置
+- `CLASH_UPSTREAM_GROUPS`：关联的上游 `Selector` 组列表（默认 `Steam`），若偏离到单节点或其它组则自动对齐回 `CLASH_FAILOVER_GROUP`
+- `CLASH_FAILOVER_CANDIDATES=*`：动态枚举策略组内真实落地节点（自动排除 `Auto`/`Fallback`/`Selector` 等嵌套策略组与 `DIRECT`/`REJECT` 虚拟节点）
+- `CLASH_FAILED_NODE_COOLDOWN_MS` / `CLASH_FAILOVER_CM_TEST_URLS`：实际登录失败节点的跨恢复轮冷却时间（默认 30 分钟），以及 `STEAM_WEB_COMPATIBILITY_MODE` 下的 Steam CM `:443` 增强探测列表（全部失效时安全降级回 Web API 候选并由登录成败驱动轮换）
 - `STEAM_GUARD_CODE`：可选，一次性 Steam Guard 验证码（更推荐使用 `STEAM_REFRESH_TOKEN`）
 - `STEAM_AUTO_RELOGIN`：是否启用 `steam-user` 内建自动重连（默认 `false`，建议使用本项目自定义重连）
 - `STEAM_CRASH_ON_ERROR`：Steam 客户端出错时是否直接退出进程（默认 `false`，使用进程内分级重试和自动恢复）

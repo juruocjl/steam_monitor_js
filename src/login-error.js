@@ -14,7 +14,7 @@ function isRateLimitLoginError(err, reason = '') {
 
 function isConnectionLoginError(err, reason = '') {
   const message = buildLoginErrorMessage(err, reason);
-  return /NoConnection|ServiceUnavailable|Request timed out|login-timeout|timed?\s*out|ECONN|ENET|EHOST|socket|network|WebSocket/i.test(
+  return /NoConnection|ServiceUnavailable|Request timed out|login-timeout|timed?\s*out|ECONN|ENET|EHOST|EPIPE|socket|network|WebSocket|TLS|SSL|SOCKS|proxy|handshake/i.test(
     message
   );
 }

@@ -22,5 +22,12 @@ test('keeps invalid credentials separate from transient failures', () => {
 test('recognizes Steam connection failures', () => {
   assert.equal(isConnectionLoginError({ message: 'NoConnection' }), true);
   assert.equal(isConnectionLoginError(null, 'login-timeout-reset'), true);
+  assert.equal(
+    isConnectionLoginError({
+      message: 'Client network socket disconnected before secure TLS connection was established',
+    }),
+    true
+  );
+  assert.equal(isConnectionLoginError({ message: 'SOCKS proxy handshake failed' }), true);
   assert.equal(isConnectionLoginError({ message: 'RateLimitExceeded' }), false);
 });

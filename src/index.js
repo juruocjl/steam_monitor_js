@@ -55,6 +55,28 @@ const CLASH_FAILOVER_CANDIDATES = String(process.env.CLASH_FAILOVER_CANDIDATES |
   .split(',')
   .map((value) => value.trim())
   .filter(Boolean);
+const CLASH_UPSTREAM_GROUPS =
+  process.env.CLASH_UPSTREAM_GROUPS !== undefined
+    ? process.env.CLASH_UPSTREAM_GROUPS.split(',')
+        .map((value) => value.trim())
+        .filter(Boolean)
+    : ['Steam'];
+const CLASH_FAILED_NODE_COOLDOWN_MS = Math.max(
+  1000,
+  Number(process.env.CLASH_FAILED_NODE_COOLDOWN_MS || 1800000)
+);
+const DEFAULT_CLASH_CM_TEST_URLS = [
+  'https://cmp1-tyo3.steamserver.net:443/cmsocket/',
+  'https://cmp1-fra1.steamserver.net:443/cmsocket/',
+];
+const CLASH_FAILOVER_CM_TEST_URLS =
+  process.env.CLASH_FAILOVER_CM_TEST_URLS !== undefined
+    ? process.env.CLASH_FAILOVER_CM_TEST_URLS.split(',')
+        .map((value) => value.trim())
+        .filter(Boolean)
+    : STEAM_WEB_COMPATIBILITY_MODE
+      ? DEFAULT_CLASH_CM_TEST_URLS
+      : [];
 const HEARTBEAT_INTERVAL_MS = Number(process.env.HEARTBEAT_INTERVAL_MS || 60000);
 
 const clashFailover = new ClashFailover({
@@ -62,9 +84,12 @@ const clashFailover = new ClashFailover({
   controllerUrl: process.env.CLASH_CONTROLLER_URL,
   secretFile: process.env.CLASH_CONTROLLER_SECRET_FILE,
   group: process.env.CLASH_FAILOVER_GROUP || 'E-IX',
+  upstreamGroups: CLASH_UPSTREAM_GROUPS,
   candidates: CLASH_FAILOVER_CANDIDATES,
   testUrl: process.env.CLASH_FAILOVER_TEST_URL,
+  cmTestUrls: CLASH_FAILOVER_CM_TEST_URLS,
   timeoutMs: Number(process.env.CLASH_FAILOVER_TEST_TIMEOUT_MS || 8000),
+  failedCooldownMs: CLASH_FAILED_NODE_COOLDOWN_MS,
 });
 
 const app = express();
@@ -222,6 +247,12 @@ function recordLoginFailure(reason, err = null, forceConnectionFailure = false) 
   }
 
   const isConnectionFailure = forceConnectionFailure || isConnectionLoginError(err, reason);
+  if (isConnectionFailure) {
+    if (client._lastChosenCM?.type === 'websockets' && client._lastChosenCM?.endpoint) {
+      clashFailover.recordCmEndpoint(client._lastChosenCM.endpoint);
+    }
+    clashFailover.recordLoginFailure(reason);
+  }
   if (recoveryMode && isConnectionFailure) {
     return 'recovery';
   }
@@ -1290,6 +1321,13 @@ client.on('friendRelationship', (steamID, relationship) => {
   friendStatuses.delete(steamId);
 });
 
+client.on('debug', (message) => {
+  const match = String(message || '').match(/Randomly chose websockets server ([^\s]+:443)\b/i);
+  if (match) {
+    clashFailover.recordCmEndpoint(match[1]);
+  }
+});
+
 client.on('user', (steamID, user) => {
   const steamId = toSteamId64(steamID);
   if (!isFriend(steamId)) {
@@ -1307,11 +1345,12 @@ async function start() {
     `Steam 连接配置: socksProxy=${STEAM_SOCKS_PROXY ? 'enabled' : 'disabled'} webCompatibilityMode=${STEAM_WEB_COMPATIBILITY_MODE}`
   );
   console.log(
-    `Clash 自动故障转移: enabled=${CLASH_AUTO_FAILOVER_ENABLED} group=${clashFailover.group} candidates=${CLASH_FAILOVER_CANDIDATES.join(',')}`
+    `Clash 自动故障转移: enabled=${CLASH_AUTO_FAILOVER_ENABLED} group=${clashFailover.group} upstreamGroups=${clashFailover.upstreamGroups.join(',') || 'none'} candidates=${CLASH_FAILOVER_CANDIDATES.join(',')} cmProbes=${CLASH_FAILOVER_CM_TEST_URLS.length}`
   );
   console.log(
     `Steam 自动恢复: quickFailures=${STEAM_MAX_CONSECUTIVE_FAILURES} recoveryBaseMs=${STEAM_RECOVERY_BASE_MS} recoveryMaxMs=${STEAM_RECOVERY_MAX_MS} rateLimitBaseMs=${STEAM_RATE_LIMIT_RECOVERY_BASE_MS} rateLimitMaxMs=${STEAM_RATE_LIMIT_RECOVERY_MAX_MS}`
   );
+  await clashFailover.ensureUpstreamAligned();
   cachedLogOnOptions = buildLogOnOptions();
   doLogOn('初次启动');
 
