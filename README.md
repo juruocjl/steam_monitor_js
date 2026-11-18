@@ -48,8 +48,14 @@ Copy-Item .env.example .env
 - `STEAM_WEB_COMPATIBILITY_MODE`：强制使用 WebSocket 443；配置 SOCKS 代理时默认启用
 - `CLASH_AUTO_FAILOVER_ENABLED`：连接失败时先探测并切换 Clash 节点，再进行一次受控重连
 - `CLASH_FAILOVER_GROUP` / `CLASH_FAILOVER_CANDIDATES`：要切换的选择器及按顺序尝试的候选组；`CLASH_FAILOVER_GROUP=auto`（默认）或配置的组名不存在时，自动结合 `/proxies` 与 `/rules` 识别当前订阅的主 `Selector` 策略组
-- `CLASH_UPSTREAM_GROUPS`：关联的上游 `Selector` 组列表（默认 `Steam,Final`），存在且包含主策略组时自动对齐，不存在时自动跳过；留空关闭
+- `CLASH_UPSTREAM_GROUPS`：关联的上游 `Selector` 组列表（默认 `Steam,Final,OpenAI,AI,ChatGPT`），存在且包含主策略组时自动对齐，不存在时自动跳过；留空关闭
 - `CLASH_FAILOVER_CANDIDATES=*`：动态枚举策略组内真实落地节点（自动排除 `Auto`/`Fallback`/`Selector` 等嵌套策略组、`DIRECT`/`REJECT` 虚拟节点，以及剩余流量/重置/到期/官网等机场信息展示假节点）
+- `CLASH_EXCLUDE_NODE_PATTERN`：动态候选池排除的节点名正则，默认排除香港（`香港`/`HK`/`Hong Kong`/`🇭🇰`；香港出口访问 `api.openai.com` 存在较高 TLS 握手重置率）；设为空串关闭排除
+- `CLASH_PREFER_LOW_MULTIPLIER`：默认 `true`，按节点名倍率排序（`1x` 优先，`2.5x` 等保留在队尾兜底；未标倍率按 `1x` 处理）
+- `CLASH_OPENAI_TEST_URL` / `CLASH_OPENAI_TEST_EXPECTED` / `CLASH_OPENAI_TEST_ATTEMPTS`：切换前的 OpenAI 附加拨测，经 Mihomo `/delay` 请求 `https://api.openai.com/v1/models`，无鉴权正常返回 `401`（零读 Key、零扣费），连续通过指定次数才算稳定；`CLASH_OPENAI_TEST_URL` 留空关闭
+- `CLASH_MATRIX_TEST_URL` / `CLASH_MATRIX_TEST_EXPECTED`：Matrix 附加拨测，默认请求 `https://matrix.org/_matrix/client/versions` 并接受 `2xx`；留空关闭
+- 候选节点需同时通过 Steam Web API、Steam CM（启用时）与附加拨测才会被选中；若所有节点均只过 Steam（如 OpenAI 全球故障），优先降级到 Steam 可达节点（`extraFallback`），其次才退到仅 Web API 节点（`cmFallback`），避免永久断连
+- 启动时若当前节点为香港排除节点或不可用，会先完成一次 `startup-check` 迁移再登录 Steam；已在合规稳定节点则原地保留
 - `CLASH_FAILED_NODE_COOLDOWN_MS` / `CLASH_FAILOVER_CM_TEST_URLS`：实际登录失败节点的跨恢复轮冷却时间（默认 30 分钟），以及 `STEAM_WEB_COMPATIBILITY_MODE` 下的 Steam CM `:443` 增强探测列表（全部失效时安全降级回 Web API 候选并由登录成败驱动轮换）
 - `STEAM_GUARD_CODE`：可选，一次性 Steam Guard 验证码（更推荐使用 `STEAM_REFRESH_TOKEN`）
 - `STEAM_AUTO_RELOGIN`：是否启用 `steam-user` 内建自动重连（默认 `false`，建议使用本项目自定义重连）

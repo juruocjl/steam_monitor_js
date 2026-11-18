@@ -6,8 +6,10 @@ const path = require('node:path');
 const test = require('node:test');
 const {
   ClashFailover,
+  DEFAULT_EXCLUDE_NODE_REGEX,
   isInfoProxyName,
   parseClashSecret,
+  parseNodeMultiplier,
   resolvePrimaryGroup,
 } = require('../src/clash-failover');
 
@@ -92,6 +94,170 @@ test('switches to an untried healthy candidate and avoids oscillation', async (t
   assert.equal(available.current, 'Fallback');
   assert.equal(available.delay, 234);
   assert.deepEqual(switches, ['Auto', 'Fallback']);
+});
+
+test('parses node multipliers and excludes Hong Kong without false positives', () => {
+  assert.equal(parseNodeMultiplier('高速隧道1x-日本-2'), 1);
+  assert.equal(parseNodeMultiplier('专线2.5x-美国-3'), 2.5);
+  assert.equal(parseNodeMultiplier('🇺🇸 US-G1 (0.6x)'), 0.6);
+  assert.equal(parseNodeMultiplier('普通节点'), 1);
+  assert.equal(parseNodeMultiplier(''), 1);
+
+  assert.ok(DEFAULT_EXCLUDE_NODE_REGEX.test('高速隧道1x-香港-5'));
+  assert.ok(DEFAULT_EXCLUDE_NODE_REGEX.test('HK 01'));
+  assert.ok(DEFAULT_EXCLUDE_NODE_REGEX.test('Hong Kong 2'));
+  assert.ok(DEFAULT_EXCLUDE_NODE_REGEX.test('🇭🇰 01'));
+  assert.ok(!DEFAULT_EXCLUDE_NODE_REGEX.test('高速隧道1x-日本-2'));
+  assert.ok(!DEFAULT_EXCLUDE_NODE_REGEX.test('Bangkok 01'));
+  assert.ok(!DEFAULT_EXCLUDE_NODE_REGEX.test('zhk-node'));
+});
+
+test('excludes Hong Kong, prefers 1x nodes and falls back to 2.5x when needed', async (t) => {
+  const nodes = ['高速隧道1x-香港-5', '专线2.5x-美国-3', '高速隧道1x-日本-2'];
+  let selected = '高速隧道1x-香港-5';
+  const switches = [];
+  const failing = new Set();
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, 'http://127.0.0.1');
+    if (req.method === 'GET' && url.pathname === '/proxies/E-IX') {
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ type: 'Selector', now: selected, all: nodes }));
+      return;
+    }
+    const delayMatch = url.pathname.match(/^\/proxies\/([^/]+)\/delay$/);
+    if (req.method === 'GET' && delayMatch) {
+      const name = decodeURIComponent(delayMatch[1]);
+      if (failing.has(name)) {
+        res.statusCode = 504;
+        res.end('timeout');
+        return;
+      }
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ delay: 50 }));
+      return;
+    }
+    if (req.method === 'PUT' && url.pathname === '/proxies/E-IX') {
+      const chunks = [];
+      req.on('data', (chunk) => chunks.push(chunk));
+      req.on('end', () => {
+        selected = JSON.parse(Buffer.concat(chunks).toString('utf8')).name;
+        switches.push(selected);
+        res.statusCode = 204;
+        res.end();
+      });
+      return;
+    }
+    res.statusCode = 404;
+    res.end();
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => server.close());
+
+  const failover = new ClashFailover({
+    enabled: true,
+    controllerUrl: `http://127.0.0.1:${server.address().port}`,
+    group: 'E-IX',
+    candidates: ['*'],
+    excludeNodePattern: DEFAULT_EXCLUDE_NODE_REGEX,
+    preferLowMultiplier: true,
+    timeoutMs: 1000,
+    logger: { warn() {}, error() {} },
+  });
+
+  const moved = await failover.ensureAvailable('startup-check');
+  assert.equal(moved.available, true);
+  assert.equal(moved.switched, true);
+  assert.equal(moved.from, '高速隧道1x-香港-5');
+  assert.equal(moved.to, '高速隧道1x-日本-2');
+  assert.deepEqual(switches, ['高速隧道1x-日本-2']);
+  assert.ok(failover.snapshot().filteredExcludedNodes.includes('高速隧道1x-香港-5'));
+
+  failing.add('高速隧道1x-日本-2');
+  failover.resetCycle();
+  const fallback = await failover.ensureAvailable('startup-check');
+  assert.equal(fallback.switched, true);
+  assert.equal(fallback.to, '专线2.5x-美国-3');
+  assert.deepEqual(switches, ['高速隧道1x-日本-2', '专线2.5x-美国-3']);
+});
+
+test('requires every extra probe, then degrades safely to Steam-reachable nodes', async (t) => {
+  const nodes = ['高速隧道1x-香港-5', '高速隧道1x-日本-2', '专线2.5x-美国-3'];
+  let selected = '高速隧道1x-香港-5';
+  let openaiMode = 'jitter';
+  const switches = [];
+  const openaiCalls = new Map();
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, 'http://127.0.0.1');
+    if (req.method === 'GET' && url.pathname === '/proxies/E-IX') {
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ type: 'Selector', now: selected, all: nodes }));
+      return;
+    }
+    const delayMatch = url.pathname.match(/^\/proxies\/([^/]+)\/delay$/);
+    if (req.method === 'GET' && delayMatch) {
+      const name = decodeURIComponent(delayMatch[1]);
+      const target = url.searchParams.get('url') || '';
+      if (target.includes('api.openai.com')) {
+        const count = (openaiCalls.get(name) || 0) + 1;
+        openaiCalls.set(name, count);
+        const jitter = openaiMode === 'jitter' && name === '高速隧道1x-日本-2' && count >= 2;
+        if (openaiMode === 'down' || jitter) {
+          res.statusCode = 503;
+          res.end('tls reset');
+          return;
+        }
+      }
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ delay: 80 }));
+      return;
+    }
+    if (req.method === 'PUT' && url.pathname === '/proxies/E-IX') {
+      const chunks = [];
+      req.on('data', (chunk) => chunks.push(chunk));
+      req.on('end', () => {
+        selected = JSON.parse(Buffer.concat(chunks).toString('utf8')).name;
+        switches.push(selected);
+        res.statusCode = 204;
+        res.end();
+      });
+      return;
+    }
+    res.statusCode = 404;
+    res.end();
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => server.close());
+
+  const failover = new ClashFailover({
+    enabled: true,
+    controllerUrl: `http://127.0.0.1:${server.address().port}`,
+    group: 'E-IX',
+    candidates: ['*'],
+    excludeNodePattern: DEFAULT_EXCLUDE_NODE_REGEX,
+    preferLowMultiplier: true,
+    cmTestUrls: ['https://cmp1-tyo3.steamserver.net:443/cmsocket/'],
+    extraProbes: [
+      { name: 'openai', url: 'https://api.openai.com/v1/models', expected: '401', attempts: 2 },
+      { name: 'matrix', url: 'https://matrix.org/_matrix/client/versions', expected: '200-299' },
+    ],
+    timeoutMs: 1000,
+    logger: { warn() {}, error() {} },
+  });
+
+  const picked = await failover.ensureAvailable('startup-check');
+  assert.equal(picked.switched, true);
+  assert.equal(picked.to, '专线2.5x-美国-3');
+  assert.equal(picked.extraVerified, true);
+  assert.deepEqual(switches, ['专线2.5x-美国-3']);
+
+  // OpenAI is unreachable from every node: switch anyway, but flag the downgrade.
+  openaiMode = 'down';
+  selected = '高速隧道1x-香港-5';
+  failover.resetCycle();
+  const degraded = await failover.ensureAvailable('startup-check');
+  assert.equal(degraded.switched, true);
+  assert.equal(degraded.extraFallback, true);
+  assert.equal(degraded.to, '高速隧道1x-日本-2');
 });
 
 test('recovery probe switches only after the current selection fails', async (t) => {

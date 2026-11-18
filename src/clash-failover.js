@@ -29,6 +29,10 @@ const BUILTIN_NON_LEAF_NAMES = new Set([
 
 const DEFAULT_FAILED_COOLDOWN_MS = 30 * 60 * 1000;
 
+// Hong Kong exits reset a large share of TLS handshakes to api.openai.com; keep
+// them out of the automatic failover pool unless the operator opts back in.
+const DEFAULT_EXCLUDE_NODE_REGEX = /香港|(?:^|[^a-z0-9])hk(?:[^a-z0-9]|$)|hong\s*kong|🇭🇰/iu;
+
 const INFO_PROXY_PATTERNS = [
   /剩余流量|流量剩余|已用流量|总流量|套餐流量|可用流量|流量重置|流量已用|无限流量/,
   /距离下次重置|下次重置|重置剩余|重置/,
@@ -44,7 +48,8 @@ const INFO_PROXY_PATTERNS = [
   /^[^\p{L}\p{N}]*(?:www\.)?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:com|net|org|io|top|xyz|cc|me|co|cn|vip|icu|shop|club|site|online|pw|link|click|buzz|fun|pro|app|dev|gg|tv|info|biz|uk|jp|kr|tw|hk|sg|us|de|fr|ru|la|ws|ai|so|ly|to|im|moe|cloud|tech|store|live|work|ltd|one)(?:\/[^\s]*)?[^\p{L}\p{N}]*$/iu,
 ];
 
-const UPSTREAM_ALIGNMENT_NAME_RE = /(?:^|[^\p{L}])steam(?:[^\p{L}]|$)|漏网之鱼/iu;
+const UPSTREAM_ALIGNMENT_NAME_RE =
+  /(?:^|[^\p{L}])(?:steam|openai|chatgpt|ai)(?:[^\p{L}]|$)|漏网之鱼/iu;
 
 function isInfoProxyName(name) {
   const trimmed = String(name || '').trim();
@@ -241,6 +246,27 @@ function parseClashSecret(content) {
   return match ? match[1] ?? match[2] ?? match[3] ?? '' : '';
 }
 
+function parseNodeMultiplier(name) {
+  const matched = String(name || '').match(
+    /(?:^|[^\d.])(\d+(?:\.\d+)?)\s*(?:[xX×]|倍)(?![a-zA-Z])/u
+  );
+  if (!matched) {
+    return 1;
+  }
+  const value = Number(matched[1]);
+  return Number.isFinite(value) && value > 0 ? value : 1;
+}
+
+function compileExcludePattern(pattern) {
+  if (pattern instanceof RegExp) {
+    return pattern;
+  }
+  if (typeof pattern === 'string' && pattern.trim()) {
+    return new RegExp(pattern, 'iu');
+  }
+  return null;
+}
+
 function normalizeNameList(value, fallback = []) {
   if (Array.isArray(value)) {
     return value.map((item) => String(item || '').trim()).filter(Boolean);
@@ -296,6 +322,16 @@ class ClashFailover {
     this.upstreamGroups = normalizeNameList(options.upstreamGroups, ['Steam', 'Final']);
     this.upstreamGroupsSet = new Set(this.upstreamGroups);
     this.candidates = Array.isArray(options.candidates) ? options.candidates.filter(Boolean) : [];
+    this.excludeNodeRegex = compileExcludePattern(options.excludeNodePattern);
+    this.preferLowMultiplier = Boolean(options.preferLowMultiplier);
+    this.extraProbes = (Array.isArray(options.extraProbes) ? options.extraProbes : [])
+      .map((probe) => ({
+        name: String(probe?.name || '').trim(),
+        url: String(probe?.url || '').trim(),
+        expected: String(probe?.expected || '200-299').trim() || '200-299',
+        attempts: Math.max(1, Number(probe?.attempts) || 1),
+      }))
+      .filter((probe) => probe.name && probe.url);
     this.testUrl = options.testUrl || 'https://api.steampowered.com/ISteamDirectory/GetCMListForConnect/v1/?cellid=0';
     this.cmTestUrls = normalizeNameList(options.cmTestUrls, []);
     this.dynamicCmUrls = [];
@@ -311,6 +347,7 @@ class ClashFailover {
     this.resolvedGroup = null;
     this.resolvedGroupSource = null;
     this.lastFilteredInfoNodes = [];
+    this.lastFilteredExcludedNodes = [];
     this.eligibleCandidateCount = null;
     this.lastAlignedUpstreams = [];
     this.lastResult = null;
@@ -358,6 +395,9 @@ class ClashFailover {
       dynamicCandidates: this.candidates.includes('*'),
       eligibleCandidateCount: this.enabled ? this.eligibleCandidateCount : null,
       filteredInfoNodes: this.enabled ? [...this.lastFilteredInfoNodes] : [],
+      filteredExcludedNodes: this.enabled ? [...this.lastFilteredExcludedNodes] : [],
+      preferLowMultiplier: this.enabled ? this.preferLowMultiplier : false,
+      extraProbes: this.enabled ? this.extraProbes.map((probe) => probe.name) : [],
       cmProbeEnabled: this.#getActiveCmTestUrls().length > 0,
       currentSelection: this.currentSelection,
       triedSelections: Array.from(this.triedSelections),
@@ -439,12 +479,14 @@ class ClashFailover {
 
       const currentEligible = Boolean(current) && this.#isEligibleSelection(current, allowed, proxies, groupName);
       const currentFailed = Boolean(current) && this.failedSelections.has(current);
-      let currentWebApiFallback = null;
+      const cmEnabled = this.#getActiveCmTestUrls().length > 0;
+      const fullyHealthy = (probe) => (probe.cmVerified || !cmEnabled) && probe.extraVerified;
+      let currentDegradedFallback = null;
 
       if (current) {
         this.triedSelections.add(current);
         if (!currentEligible) {
-          this.logger.warn(`Clash 当前节点为非落地策略组、信息提示条目或不在候选池: ${current}，准备迁移到真实代理节点`);
+          this.logger.warn(`Clash 当前节点为非落地策略组、信息提示条目、排除节点或不在候选池: ${current}，准备迁移到真实代理节点`);
         } else if (currentFailed) {
           const failureInfo = this.failedSelections.get(current);
           this.logger.warn(
@@ -453,7 +495,7 @@ class ClashFailover {
         } else {
           try {
             const probe = await this.#probeNode(current);
-            if (probe.cmVerified || this.#getActiveCmTestUrls().length === 0) {
+            if (fullyHealthy(probe)) {
               this.lastResult = {
                 available: true,
                 switched: false,
@@ -463,18 +505,27 @@ class ClashFailover {
                 current,
                 delay: probe.delay,
                 cmVerified: probe.cmVerified,
+                extraVerified: probe.extraVerified,
                 alignedUpstreams,
               };
               return this.lastResult;
             }
 
-            currentWebApiFallback = {
+            // Steam 可达但附加拨测（OpenAI/Matrix）失败，比仅过 Web API 更可用。
+            const rank = probe.cmVerified || !cmEnabled ? 2 : 1;
+            currentDegradedFallback = {
               candidate: current,
               delay: probe.delay,
+              cmVerified: probe.cmVerified,
               cmError: probe.cmError,
+              extraVerified: probe.extraVerified,
+              extraError: probe.extraError,
+              rank,
             };
             this.logger.warn(
-              `Clash 当前节点 Web API 可达但 Steam CM 探测失败: ${current}: ${probe.cmError || 'CM 不可达'}`
+              `Clash 当前节点未通过全部拨测，继续寻找更优节点: ${current}: ${
+                probe.extraError || probe.cmError || 'Steam CM 或附加拨测不可达'
+              }`
             );
           } catch (err) {
             this.logger.warn(`Clash 当前节点不可用: ${current}: ${err.message}`);
@@ -498,9 +549,10 @@ class ClashFailover {
         return freshPick;
       }
 
-      if (currentWebApiFallback && !currentFailed) {
+      if (currentDegradedFallback && !currentFailed) {
+        const degraded = currentDegradedFallback;
         this.logger.warn(
-          `没有通过 Steam CM 增强探测的其它节点，暂保留当前 Web API 可达节点: ${current}`
+          `没有完全达标的其它节点，暂保留当前降级可用节点: ${current}`
         );
         this.lastResult = {
           available: true,
@@ -509,9 +561,10 @@ class ClashFailover {
           reason,
           group: groupName,
           current,
-          delay: currentWebApiFallback.delay,
-          cmVerified: false,
-          cmFallback: true,
+          delay: degraded.delay,
+          cmVerified: degraded.cmVerified,
+          extraVerified: degraded.extraVerified,
+          ...(degraded.rank < 2 ? { cmFallback: true } : { extraFallback: true }),
           alignedUpstreams,
         };
         return this.lastResult;
@@ -527,7 +580,7 @@ class ClashFailover {
         return recycledPick;
       }
 
-      if (allEligible.length === 1 && current && currentEligible && currentFailed && !currentWebApiFallback) {
+      if (allEligible.length === 1 && current && currentEligible && currentFailed && !currentDegradedFallback) {
         try {
           const probe = await this.#probeNode(current);
           this.failedSelections.delete(current);
@@ -638,33 +691,68 @@ class ClashFailover {
     } = options;
     const cmEnabled = this.#getActiveCmTestUrls().length > 0;
     let webApiFallback = null;
+    let steamOnlyFallback = null;
 
     for (const candidate of candidates) {
       this.triedSelections.add(candidate);
       try {
         const probe = await this.#probeNode(candidate);
-        if (cmEnabled && !probe.cmVerified) {
-          if (!webApiFallback) {
-            webApiFallback = { candidate, probe };
+        const steamHealthy = probe.cmVerified || !cmEnabled;
+
+        if (steamHealthy && probe.extraVerified) {
+          return await this.#switchToCandidate(candidate, current, reason, probe, {
+            groupName,
+            recoveryMode,
+            alignedUpstreams,
+            clearFailedOnSelect,
+            cmFallback: false,
+          });
+        }
+
+        if (steamHealthy) {
+          if (!steamOnlyFallback) {
+            steamOnlyFallback = { candidate, probe };
           }
           this.logger.warn(
-            `Clash ${recoveryMode ? '恢复' : ''}候选节点仅过 Web API 但 Steam CM 不可达，先跳过: ${candidate}: ${
-              probe.cmError || 'CM 不可达'
+            `Clash ${recoveryMode ? '恢复' : ''}候选节点 Steam 可达但附加拨测未通过，先跳过: ${candidate}: ${
+              probe.extraError || '附加拨测不可达'
             }`
           );
           continue;
         }
 
-        return await this.#switchToCandidate(candidate, current, reason, probe, {
+        if (!webApiFallback) {
+          webApiFallback = { candidate, probe };
+        }
+        this.logger.warn(
+          `Clash ${recoveryMode ? '恢复' : ''}候选节点仅过 Web API 但 Steam CM 不可达，先跳过: ${candidate}: ${
+            probe.cmError || 'CM 不可达'
+          }`
+        );
+      } catch (err) {
+        this.logger.warn(`Clash ${recoveryMode ? '恢复' : ''}候选节点不可用: ${candidate}: ${err.message}`);
+      }
+    }
+
+    if (steamOnlyFallback) {
+      this.logger.warn(
+        `没有通过全部拨测的候选节点，安全降级选用 Steam 可达节点: ${steamOnlyFallback.candidate}: ${
+          steamOnlyFallback.probe.extraError || '附加拨测不可达'
+        }`
+      );
+      return await this.#switchToCandidate(
+        steamOnlyFallback.candidate,
+        current,
+        reason,
+        steamOnlyFallback.probe,
+        {
           groupName,
           recoveryMode,
           alignedUpstreams,
           clearFailedOnSelect,
-          cmFallback: false,
-        });
-      } catch (err) {
-        this.logger.warn(`Clash ${recoveryMode ? '恢复' : ''}候选节点不可用: ${candidate}: ${err.message}`);
-      }
+          extraFallback: true,
+        }
+      );
     }
 
     if (webApiFallback) {
@@ -690,6 +778,7 @@ class ClashFailover {
       alignedUpstreams = [],
       clearFailedOnSelect = false,
       cmFallback = false,
+      extraFallback = false,
     } = options;
 
     await this.#request(`/proxies/${encodeURIComponent(groupName)}`, 'PUT', { name: candidate });
@@ -707,6 +796,7 @@ class ClashFailover {
       to: candidate,
       delay: probe.delay,
       cmVerified: probe.cmVerified,
+      extraVerified: probe.extraVerified,
       alignedUpstreams,
     };
     if (recoveryMode) {
@@ -715,18 +805,27 @@ class ClashFailover {
     if (cmFallback) {
       result.cmFallback = true;
     }
+    if (extraFallback) {
+      result.extraFallback = true;
+    }
 
     this.lastResult = result;
     this.logger.warn(
       `Clash ${recoveryMode ? '恢复探测切换成功' : '节点故障转移成功'}: ${groupName} ${
         current || 'unknown'
-      } -> ${candidate}, Steam ${probe.cmVerified ? 'CM' : 'WebAPI'} ${probe.delay}ms`
+      } -> ${candidate}, Steam ${probe.cmVerified ? 'CM' : 'WebAPI'} ${probe.delay}ms${
+        probe.extraVerified ? '' : '，附加拨测降级'
+      }`
     );
     return this.lastResult;
   }
 
   #isAutoGroup() {
     return this.group.toLowerCase() === 'auto';
+  }
+
+  #isExcludedNode(name) {
+    return Boolean(this.excludeNodeRegex && this.excludeNodeRegex.test(String(name || '').trim()));
   }
 
   #countNonGlobalSelectors(proxies) {
@@ -777,6 +876,13 @@ class ClashFailover {
     } else {
       this.lastFilteredInfoNodes = [];
     }
+
+    this.lastFilteredExcludedNodes =
+      this.candidates.includes('*') && this.excludeNodeRegex
+        ? entries.filter(
+            (name) => isRealLeafEntry(name, groupName, proxies) && this.#isExcludedNode(name)
+          )
+        : [];
 
     this.eligibleCandidateCount =
       entries.length > 0 ? this.#partitionCandidates(allowed, null, proxies, groupName).allEligible.length : 0;
@@ -981,6 +1087,10 @@ class ClashFailover {
       return false;
     }
 
+    if (this.#isExcludedNode(name)) {
+      return false;
+    }
+
     if (proxies && proxies[name]) {
       if (isNonLeafMeta(proxies[name])) {
         return false;
@@ -1011,6 +1121,12 @@ class ClashFailover {
       }
     }
 
+    if (this.preferLowMultiplier) {
+      // Array.prototype.sort is stable, so equal multipliers keep the
+      // subscription order while 1x nodes move ahead of 2.5x fallbacks.
+      freshCandidates.sort((a, b) => parseNodeMultiplier(a) - parseNodeMultiplier(b));
+    }
+
     recycledCandidates.sort((a, b) => {
       const atA = this.failedSelections.get(a)?.at ?? 0;
       const atB = this.failedSelections.get(b)?.at ?? 0;
@@ -1031,38 +1147,49 @@ class ClashFailover {
   async #probeNode(candidate) {
     const apiDelay = await this.#probeUrl(candidate, this.testUrl, '200-299');
     const cmUrls = this.#getActiveCmTestUrls();
-    if (cmUrls.length === 0) {
-      return {
-        delay: apiDelay,
-        apiDelay,
-        cmVerified: false,
-        cmUrl: null,
-        cmError: null,
-      };
+    let cmVerified = false;
+    let cmDelay = null;
+    let cmUrl = null;
+    let cmError = null;
+
+    for (const url of cmUrls) {
+      try {
+        cmDelay = await this.#probeUrl(candidate, url, '200-499');
+        cmVerified = true;
+        cmUrl = url;
+        cmError = null;
+        break;
+      } catch (err) {
+        cmError = err;
+      }
     }
 
-    let lastCmError = null;
-    for (const cmUrl of cmUrls) {
+    let extraVerified = true;
+    let extraError = null;
+    const extraDelays = {};
+    for (const probeSpec of this.extraProbes) {
       try {
-        const cmDelay = await this.#probeUrl(candidate, cmUrl, '200-499');
-        return {
-          delay: cmDelay,
-          apiDelay,
-          cmVerified: true,
-          cmUrl,
-          cmError: null,
-        };
+        const delays = [];
+        for (let attempt = 0; attempt < probeSpec.attempts; attempt += 1) {
+          delays.push(await this.#probeUrl(candidate, probeSpec.url, probeSpec.expected));
+        }
+        extraDelays[probeSpec.name] = delays;
       } catch (err) {
-        lastCmError = err;
+        extraVerified = false;
+        extraError = `${probeSpec.name}: ${err.message}`;
+        break;
       }
     }
 
     return {
-      delay: apiDelay,
+      delay: cmVerified ? cmDelay : apiDelay,
       apiDelay,
-      cmVerified: false,
-      cmUrl: null,
-      cmError: lastCmError?.message || 'Steam CM 不可达',
+      cmVerified,
+      cmUrl,
+      cmError: cmVerified ? null : cmError?.message || (cmUrls.length > 0 ? 'Steam CM 不可达' : null),
+      extraVerified,
+      extraError,
+      extraDelays,
     };
   }
 
@@ -1144,7 +1271,10 @@ class ClashFailover {
 module.exports = {
   ClashFailover,
   NON_LEAF_PROXY_TYPES,
+  DEFAULT_EXCLUDE_NODE_REGEX,
   isInfoProxyName,
   parseClashSecret,
+  parseNodeMultiplier,
+  compileExcludePattern,
   resolvePrimaryGroup,
 };

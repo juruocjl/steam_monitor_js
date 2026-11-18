@@ -5,7 +5,7 @@ const express = require('express');
 const SteamUser = require('steam-user');
 const { HttpsProxyAgent } = require('hpagent');
 const sqlite3 = require('sqlite3').verbose();
-const { ClashFailover } = require('./clash-failover');
+const { ClashFailover, DEFAULT_EXCLUDE_NODE_REGEX } = require('./clash-failover');
 const { calculateExponentialBackoff } = require('./recovery-backoff');
 const {
   isConnectionLoginError,
@@ -60,7 +60,45 @@ const CLASH_UPSTREAM_GROUPS =
     ? process.env.CLASH_UPSTREAM_GROUPS.split(',')
         .map((value) => value.trim())
         .filter(Boolean)
-    : ['Steam', 'Final'];
+    : ['Steam', 'Final', 'OpenAI', 'AI', 'ChatGPT'];
+const CLASH_EXCLUDE_NODE_PATTERN =
+  process.env.CLASH_EXCLUDE_NODE_PATTERN !== undefined
+    ? process.env.CLASH_EXCLUDE_NODE_PATTERN
+    : DEFAULT_EXCLUDE_NODE_REGEX.source;
+const CLASH_PREFER_LOW_MULTIPLIER =
+  String(process.env.CLASH_PREFER_LOW_MULTIPLIER || 'true').toLowerCase() !== 'false';
+const CLASH_OPENAI_TEST_URL =
+  process.env.CLASH_OPENAI_TEST_URL !== undefined
+    ? String(process.env.CLASH_OPENAI_TEST_URL).trim()
+    : 'https://api.openai.com/v1/models';
+const CLASH_OPENAI_TEST_EXPECTED = String(process.env.CLASH_OPENAI_TEST_EXPECTED || '401').trim() || '401';
+const CLASH_OPENAI_TEST_ATTEMPTS = Math.max(
+  1,
+  Number.parseInt(process.env.CLASH_OPENAI_TEST_ATTEMPTS || '2', 10) || 2
+);
+const CLASH_MATRIX_TEST_URL =
+  process.env.CLASH_MATRIX_TEST_URL !== undefined
+    ? String(process.env.CLASH_MATRIX_TEST_URL).trim()
+    : 'https://matrix.org/_matrix/client/versions';
+const CLASH_MATRIX_TEST_EXPECTED =
+  String(process.env.CLASH_MATRIX_TEST_EXPECTED || '200-299').trim() || '200-299';
+const CLASH_EXTRA_PROBES = [];
+if (CLASH_OPENAI_TEST_URL) {
+  CLASH_EXTRA_PROBES.push({
+    name: 'openai',
+    url: CLASH_OPENAI_TEST_URL,
+    expected: CLASH_OPENAI_TEST_EXPECTED,
+    attempts: CLASH_OPENAI_TEST_ATTEMPTS,
+  });
+}
+if (CLASH_MATRIX_TEST_URL) {
+  CLASH_EXTRA_PROBES.push({
+    name: 'matrix',
+    url: CLASH_MATRIX_TEST_URL,
+    expected: CLASH_MATRIX_TEST_EXPECTED,
+    attempts: 1,
+  });
+}
 const CLASH_FAILED_NODE_COOLDOWN_MS = Math.max(
   1000,
   Number(process.env.CLASH_FAILED_NODE_COOLDOWN_MS || 1800000)
@@ -86,6 +124,9 @@ const clashFailover = new ClashFailover({
   group: process.env.CLASH_FAILOVER_GROUP || 'auto',
   upstreamGroups: CLASH_UPSTREAM_GROUPS,
   candidates: CLASH_FAILOVER_CANDIDATES,
+  excludeNodePattern: CLASH_EXCLUDE_NODE_PATTERN,
+  preferLowMultiplier: CLASH_PREFER_LOW_MULTIPLIER,
+  extraProbes: CLASH_EXTRA_PROBES,
   testUrl: process.env.CLASH_FAILOVER_TEST_URL,
   cmTestUrls: CLASH_FAILOVER_CM_TEST_URLS,
   timeoutMs: Number(process.env.CLASH_FAILOVER_TEST_TIMEOUT_MS || 8000),
@@ -1345,16 +1386,24 @@ async function start() {
     `Steam 连接配置: socksProxy=${STEAM_SOCKS_PROXY ? 'enabled' : 'disabled'} webCompatibilityMode=${STEAM_WEB_COMPATIBILITY_MODE}`
   );
   console.log(
-    `Clash 自动故障转移: enabled=${CLASH_AUTO_FAILOVER_ENABLED} group=${clashFailover.group} upstreamGroups=${clashFailover.upstreamGroups.join(',') || 'none'} candidates=${CLASH_FAILOVER_CANDIDATES.join(',')} cmProbes=${CLASH_FAILOVER_CM_TEST_URLS.length}`
+    `Clash 自动故障转移: enabled=${CLASH_AUTO_FAILOVER_ENABLED} group=${clashFailover.group} upstreamGroups=${clashFailover.upstreamGroups.join(',') || 'none'} candidates=${CLASH_FAILOVER_CANDIDATES.join(',')} cmProbes=${CLASH_FAILOVER_CM_TEST_URLS.length} excludePattern=${CLASH_EXCLUDE_NODE_PATTERN || 'none'} preferLowMultiplier=${CLASH_PREFER_LOW_MULTIPLIER} extraProbes=${CLASH_EXTRA_PROBES.map((probe) => `${probe.name}x${probe.attempts}`).join(',') || 'none'}`
   );
   console.log(
     `Steam 自动恢复: quickFailures=${STEAM_MAX_CONSECUTIVE_FAILURES} recoveryBaseMs=${STEAM_RECOVERY_BASE_MS} recoveryMaxMs=${STEAM_RECOVERY_MAX_MS} rateLimitBaseMs=${STEAM_RATE_LIMIT_RECOVERY_BASE_MS} rateLimitMaxMs=${STEAM_RATE_LIMIT_RECOVERY_MAX_MS}`
   );
   await clashFailover.ensureUpstreamAligned();
   if (CLASH_AUTO_FAILOVER_ENABLED) {
+    // Move off an excluded (e.g. Hong Kong) or dead node before the first logon,
+    // but keep a compliant healthy current selection untouched.
+    const startupCheck = await clashFailover.ensureAvailable('startup-check');
+    if (startupCheck?.switched) {
+      console.log(`Clash 启动前节点检查切换: ${startupCheck.from || 'unknown'} -> ${startupCheck.to}`);
+    } else if (startupCheck?.available === false) {
+      console.warn(`Clash 启动前节点检查未找到可用节点: ${startupCheck.error || 'unknown'}`);
+    }
     const clashSnapshot = clashFailover.snapshot();
     console.log(
-      `Clash 主策略组解析: configured=${clashSnapshot.group} resolved=${clashSnapshot.resolvedGroup || 'unresolved'} source=${clashSnapshot.resolvedGroupSource || 'none'} current=${clashSnapshot.currentSelection || 'none'} eligible=${clashSnapshot.eligibleCandidateCount ?? 0} filteredInfo=${clashSnapshot.filteredInfoNodes.length}`
+      `Clash 主策略组解析: configured=${clashSnapshot.group} resolved=${clashSnapshot.resolvedGroup || 'unresolved'} source=${clashSnapshot.resolvedGroupSource || 'none'} current=${clashSnapshot.currentSelection || 'none'} eligible=${clashSnapshot.eligibleCandidateCount ?? 0} filteredInfo=${clashSnapshot.filteredInfoNodes.length} filteredExcluded=${clashSnapshot.filteredExcludedNodes.length} preferLowMultiplier=${clashSnapshot.preferLowMultiplier} extraProbes=${clashSnapshot.extraProbes.join(',') || 'none'}`
     );
   }
   cachedLogOnOptions = buildLogOnOptions();
